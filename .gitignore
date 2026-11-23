@@ -221,3 +221,16 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Python 가상환경
+.venv-xpu/
+
+# RAG 자동 생성 벡터 DB
+.safemate/
+
+# Python 임시 파일
+__pycache__/
+*.pyc
+
+# 비밀 환경 설정
+.env
