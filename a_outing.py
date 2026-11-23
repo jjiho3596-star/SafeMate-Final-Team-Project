@@ -1,60 +1,81 @@
 """SafeMate A기능 1단계. 한국 시각으로 외출 출발 시각이 속한 정시 구간의 예보를 조회한다."""
 
-import json
+import json     # 데이터 분석
 import math
-import re
-from datetime import datetime, time, timedelta, timezone
-from http.client import HTTPException
-from urllib import request
-from urllib.error import HTTPError
-from urllib.parse import urlencode
+import re   # 정규표현식은 표현 처리 -> 문자열에서 특정한 형태의 문자나 숫자를 찾기 위한 규칙
+from datetime import datetime, time, timedelta, timezone # 날짜와 시각 / 하루 중 시각 / 시간 간격 / 시간대 설정
+from http.client import HTTPException # 예외들을 처리하기 위한 기반 예외 클래스
+from urllib import request # SafeMate에서 Open-Meteo 기상 API 서버에 요청을 보내고,
+                           # 서버가 반환하는 날씨 데이터를 받아올 때 사용한다.
+from urllib.error import HTTPError  # HTTP 요청에서 발생하는 오류를 처리합니다.
+from urllib.parse import urlencode  # Python의 딕셔너리를 URL에 들어가는 요청 파라미터 문자열로 변환
 
 
-KST = timezone(timedelta(hours=9), "KST")
-FORECAST_DAYS = 16  # Open-Meteo의 최대 기간. 개별 항목은 더 일찍 끝날 수 있다.
+KST = timezone(timedelta(hours=9), "KST") # 한국 표준시 설정 // 9시간의 시간 차이
+FORECAST_DAYS = 16  # 날씨 예보를 조회할 기간을 나타내는 변수 // 최대 16일 범위의 예보 요청 가능
 API_URL = "https://api.open-meteo.com/v1/forecast"
-CITY_COORDINATES = {"인천": (37.4563, 126.7052), "서울": (37.5665, 126.9780)}
-HOURLY_FIELDS = (
-    "temperature_2m", "apparent_temperature", "wind_speed_10m",
-    "precipitation", "precipitation_probability",
+CITY_COORDINATES = {"인천": (37.4563, 126.7052), "서울": (37.5665, 126.9780)} # 도시별 위도와 경도
+HOURLY_FIELDS = ( # 조회할 시간별 기상 항목
+    "temperature_2m",   # 지상 2m 높이의 기온
+    "apparent_temperature", # 사람이 느끼는 체감온도 
+    "wind_speed_10m", # 지상 10m 높이의 풍속
+    "precipitation", # 	해당 시간 구간의 강수량
+    "precipitation_probability", # 	강수 확률
 )
 
-
-class WeatherError(Exception):
+# SafeMate 날씨 조회 과정에서 발생하는 오류를 관리하는 사용자 정의 예외 클래스
+class WeatherError(Exception): # Exception은 Python에서 이미 만들어 놓은 내장 클래스
     """조회 중단 이유와 사용자에게 보여 줄 안내를 함께 전달한다."""
 
+    # 오류 상태(status)와 안내 메시지(message)를 전달받아 초기화
     def __init__(self, status: str, message: str):
+
+        # 부모 클래스 Exception에 오류 메시지를 전달
         super().__init__(message)
+        # 오류 종류를 객체의 status 속성에 저장
         self.status = status
 
-
-def parse_outing_time(
+# 외출 시간을 해석하고 변환하는 함수
+# 사용자가 입력한 외출 날짜와 시간을 검사한뒤, 파이썬이 처리 할 수있는 한국 표준시로(KST)의 날짜, 시간, 데이터로 변환하는 함수
+def parse_outing_time(  # 1. 외출 날짜, 외출 시간, 현재 시간을 전달받는 함수 생성
     outing_date: str | None, outing_time: str | None, now: datetime
-) -> datetime:
+) -> datetime: # 정상 처리되면 날짜, 시간 객체를 반환.
     """오늘·내일·모레 또는 달력 날짜와 24시간제 시각을 한국 시각으로 바꾼다."""
+
+
+    # 2. 날짜와 시간이 제대로 입력되었는지 검사.
     if not isinstance(outing_date, str) or not outing_date.strip():
         raise WeatherError("needs_input", "외출 날짜를 입력해 주세요. 예) 내일 또는 YYYY-MM-DD")
+    
     if not isinstance(outing_time, str) or not outing_time.strip():
         raise WeatherError("needs_input", "외출 시간을 24시간제로 입력해 주세요. 예) 14:30")
 
-    day_text = outing_date.strip()
+
+    # 3. 날짜와 시간 변환
+    day_text = outing_date.strip()  # 불필요한 공백을 제거 -> '오늘', '내일', '모레'를 실제 날짜로 바꿀 준비를 함
     clock_text = outing_time.strip()
     offsets = {"오늘": 0, "내일": 1, "모레": 2}
+
     if day_text in offsets:
         day_text = (now.date() + timedelta(days=offsets[day_text])).isoformat()
-    if not re.fullmatch(r"[0-9]{1,2}:[0-9]{2}", clock_text):
+    if not re.fullmatch(r"[0-9]{1,2}:[0-9]{2}", clock_text):    # 시간이 14:30 이와 같은 형식인지 확인
         raise WeatherError("needs_input", "시와 분을 함께 입력해 주세요. 예) 오후 2시 반은 14:30")
     try:
-        local_time = datetime.strptime(f"{day_text} {clock_text}", "%Y-%m-%d %H:%M")
-        outing = local_time.replace(tzinfo=KST)
+        local_time = datetime.strptime(f"{day_text} {clock_text}", "%Y-%m-%d %H:%M") # 문자열을 날짜·시간 객체로 변환
+        outing = local_time.replace(tzinfo=KST) # 한국 표준시 설정
     except ValueError:
         raise WeatherError("needs_input", "달력 날짜와 시간을 확인해 주세요. 예) 내일, 14:30") from None
 
-    if outing < now.replace(second=0, microsecond=0):
+
+    # 4. 외출 시간이 유효한지 확인 // 과거 시간 or 16일 예보 범위를 벗어났는지 확인
+    if outing < now.replace(second=0, microsecond=0): # 이미 지난 외출 시간인지 확인합니다.
         raise WeatherError("out_of_range", "이미 지난 외출 시각입니다. 현재 또는 이후 시각을 입력해 주세요.")
-    if outing.date() >= now.date() + timedelta(days=FORECAST_DAYS):
+    
+    if outing.date() >= now.date() + timedelta(days=FORECAST_DAYS): # 설정된 예보 조회 기간인 16일의 범위를 벗어나는 날짜인지 확인
         last_day = now.date() + timedelta(days=FORECAST_DAYS - 1)
         raise WeatherError("out_of_range", f"한국 시간 기준 최대 {last_day}까지 조회할 수 있습니다.")
+
+    # 5. 최종 결과 반환
     return outing
 
 
