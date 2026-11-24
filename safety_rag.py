@@ -100,6 +100,7 @@ class SafetyError(Exception):
         self.status = status
 
 
+
 def matches_approved_pdf(path: Path) -> bool:
     """지정된 이름의 PDF와 승인했을 때 기록한 SHA-256이 일치하는지 확인한다."""
     expected = APPROVED_SHA256.get(path.name)
@@ -112,11 +113,13 @@ def matches_approved_pdf(path: Path) -> bool:
         raise SafetyError("document_error", f"{path.name} 파일을 읽을 수 없습니다. {error}") from error
 
 
+
 def between(text, start, stop=None):
     """확인한 제목·문단 경계가 바뀌면 인용을 중단한다."""
     begin = text.index(start)
     end = text.index(stop, begin + len(start)) if stop else len(text)
     return text[begin:end].strip()
+
 
 
 def make_section(filename, pdf_page, heading, body, printed_page=None):
@@ -133,6 +136,7 @@ def make_section(filename, pdf_page, heading, body, printed_page=None):
     if printed_page is not None:
         metadata["printed_page"] = printed_page
     return Document(page_content=" ".join(body.split()), metadata=metadata)
+
 
 
 def heat_sections(path, pages):
@@ -170,6 +174,7 @@ def heat_sections(path, pages):
             yield make_section(HEAT, page_no, heading, between(halves[key], start, end), printed)
 
 
+
 def article_sections(filename, pages):
     """기사 원문의 문단·번호별로 나눈다. 각 인용의 실제 PDF 면을 따라간다."""
     if filename == STORM:
@@ -200,6 +205,7 @@ def article_sections(filename, pages):
     yield make_section(WINTER, 4, "겨울 대설 한파 쉼터", shelter)
 
 
+
 def load_sections(data_dir):
     """승인 파일 세 개만 PyPDFLoader로 면별 로드한다."""
     from langchain_community.document_loaders import PyPDFLoader
@@ -218,6 +224,7 @@ def load_sections(data_dir):
     return sections
 
 
+
 def split_sections(sections):
     """검색용 소제목과 실제 인용할 원문을 구분해 보관한다."""
     from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -230,6 +237,7 @@ def split_sections(sections):
         chunk.metadata["excerpt"] = chunk.page_content
         chunk.page_content = chunk.metadata["heading"] + "\n" + chunk.page_content
     return chunks
+
 
 
 # %% 임베딩 장치와 모델
@@ -253,6 +261,7 @@ def configure_embedding_device(requested: str) -> str:
     except Exception as error:
         raise SafetyError("device_error", f"{requested} 장치 확인 실패. PyTorch 빌드와 드라이버를 확인해 주세요. {error}") from error
     return str(device)
+
 
 
 def verify_embedding_device(encoder, selected: str) -> dict:
@@ -289,6 +298,7 @@ def verify_embedding_device(encoder, selected: str) -> dict:
     }
 
 
+
 @lru_cache(maxsize=3)
 def load_embeddings(device: str):
     """장치별 모델을 한 번 준비하고 모델과 검증 정보를 함께 재사용한다."""
@@ -306,6 +316,7 @@ def load_embeddings(device: str):
     except Exception as error:
         raise SafetyError("model_error", f"{selected} 모델 로딩·추론 실패. 다운로드·메모리·지원 연산을 확인해 주세요. {error}") from error
     return model, details
+
 
 
 # %% Chroma 영구 색인
@@ -330,9 +341,11 @@ def corpus_key(data_dir):
     return digest.hexdigest()
 
 
+
 def cosine_score(distance):
     """Chroma의 코사인 거리를 0~1 범위의 검색 점수로 바꾼다."""
     return max(0.0, min(1.0, 1.0 - distance))
+
 
 
 @dataclass
@@ -344,6 +357,7 @@ class SafetyIndex:
     chunks: int
     reused: bool
     path: Path
+
 
 
 @lru_cache(maxsize=3)
@@ -369,6 +383,7 @@ def open_safety_store(path, device):
         collection_configuration={"hnsw": {"space": "cosine"}},
         relevance_score_fn=cosine_score,
     )
+
 
 
 def prepare_safety_index(
@@ -417,6 +432,7 @@ def prepare_safety_index(
     return SafetyIndex(retriever, dict(device_info), len(ready), reused, path)
 
 
+
 # %% 질문 → 근거 검색 결과
 def rank_passages(question, documents):
     """의미 검색 후보 안에서 질문의 구체적인 단어가 원문에도 있는 문단을 우선한다."""
@@ -436,6 +452,7 @@ def rank_passages(question, documents):
         return []
     best_hits = rank(ranked[0])[0]
     return [doc for doc in ranked if rank(doc)[0] == best_hits][:2]
+
 
 
 def search_safety_guidance(question: str | None, index: SafetyIndex) -> dict:
@@ -473,6 +490,7 @@ def search_safety_guidance(question: str | None, index: SafetyIndex) -> dict:
     if not hits:
         return result("insufficient_evidence", "승인된 자료에서 이 질문에 충분한 근거를 찾지 못했습니다.", [])
     return result("ok", "외출 안전 관련 원문을 찾았습니다.", hits)
+
 
 
 # %% 독립 실행
