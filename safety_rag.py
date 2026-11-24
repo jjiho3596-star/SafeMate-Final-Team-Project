@@ -102,34 +102,55 @@ class SafetyError(Exception):
 
 
 
-
+# %% 공식 PDF 원본 무결성 검증 함수
 def matches_approved_pdf(path: Path) -> bool:
     """지정된 이름의 PDF와 승인했을 때 기록한 SHA-256이 일치하는지 확인한다."""
+
+    # 1. 승인된 PDF 목록에서 해시값을 가져오고, 파일 존재 여부를 확인함
+    # 승인 목록에 없거나 실제 파일에 존재하지 않으면 False를 반환함.
     expected = APPROVED_SHA256.get(path.name)
     if expected is None or not path.is_file():
         return False
+
+    # 2. PDF를 바이너리 모드(rb)로 열어 SHA-256 해시값을 계산함
+    # 계산한 해시값이 승인된 해시값과 일치하면 True, 다르면 False를 반환함.
     try:
         with path.open("rb") as pdf:
             return hashlib.file_digest(pdf, "sha256").hexdigest() == expected
+
+    # 3. 파일을 읽는 과정에서 오류가 발생하면 SafeMate의 문서 오류로 반환함
     except OSError as error:
         raise SafetyError("document_error", f"{path.name} 파일을 읽을 수 없습니다. {error}") from error
 
 
 
-
+# %% 문서의 특정 구간 추출 함수
 def between(text, start, stop=None):
     """확인한 제목·문단 경계가 바뀌면 인용을 중단한다."""
+
+    # 1. 전체 문서(text)에서 시작 문자열(start)의 위치를 찾는다.
     begin = text.index(start)
+
+    # 2. 종료 문자열(stop)이 지정되면 시작 문자열 이후부터 종료 위치를 찾는다.
+    # 종료 문자열이 지정되지 않으면 문서의 마지막까지 추출 범위로 설정한다.
     end = text.index(stop, begin + len(start)) if stop else len(text)
+    
+    # 3. 시작 위치부터 종료 위치 직전까지의 텍스트를 추출한다.
+    # strip()으로 앞뒤의 불필요한 공백과 줄바꿈을 제거한 후 반환한다.
     return text[begin:end].strip()
 
 
 
-
+# %% 문서 구간 생성 및 출처 정보 저장 함수
 def make_section(filename, pdf_page, heading, body, printed_page=None):
     """한 문단에 발행 기관, 원문 URL, PDF 면과 인쇄 쪽 정보를 붙인다."""
+
+    # 1. LangChain에서 문서 내용과 출처 정보를 함께 관리하는 Document 클래스를 불러온다.
     from langchain_core.documents import Document
 
+    # 2. SOURCES에서 해당 파일의 기존 출처 정보를 가져온다.
+    # 파일명, PDF 페이지 번호, 문단 제목, 주제를 메타데이터에 추가한다.
+    # 주제(topic)는 문단 제목을 공백으로 나눈 후 첫 번째 단어를 사용한다
     metadata = {
         **SOURCES[filename],
         "filename": filename,
@@ -137,18 +158,29 @@ def make_section(filename, pdf_page, heading, body, printed_page=None):
         "heading": heading,
         "topic": heading.split()[0],
     }
+
+    # 3. 문서에 실제 인쇄된 페이지 번호가 제공된 경우에만 메타데이터에 추가한다.
+    # PDF 파일의 페이지 번호와 문서에 인쇄된 페이지 번호를 구분하여 관리한다.
     if printed_page is not None:
         metadata["printed_page"] = printed_page
+
+    # 4. 본문의 불필요한 공백과 줄바꿈을 하나의 공백으로 정리한다.
+    # 정리된 본문과 출처 정보를 Document 객체로 묶어 반환한다.
+    # 이를 통해 RAG 검색 결과에서 문서의 내용과 출처를 함께 확인할 수 있다.
     return Document(page_content=" ".join(body.split()), metadata=metadata)
 
 
 
-
+# %% 폭염 안전 행동 요령 PDF 문단 추출 함수
+# 폭염 안전 수칙 PDF에서 필요한 내용만 추출하고 출처를 검증하여 RAG 검색용 데이터로 변환하는 함수.
 def heat_sections(path, pages):
     """펼침면은 반쪽씩 읽고, 실제 하단의 쪽수와 PyPDFLoader 면을 대조한다."""
+    # 1. PDF의 특정 영역을 잘라내고 텍스트를 추출하기 위해 pdfplumber를 불러온다.
     import pdfplumber
 
-    # (PDF 면, 왼쪽=0/오른쪽=1, 인쇄 쪽, 검색 주제, 본문 시작, 다음 절)
+    # 2. RAG 검색에 사용할 폭염 안전 행동 요령의 추출 범위를 정의한다.
+    # 각 튜플은 PDF 면, 왼쪽(0)/오른쪽(1), 인쇄 쪽수,
+    # 검색 주제, 본문 시작 문자열, 종료 문자열 순서로 구성한다.
     excerpts = [
         (7, 0, 10, "폭염 노인", "노인\n", "어린이\n"),
         (12, 0, 20, "폭염 외출 복장과 햇볕", "①", "②"),
@@ -161,52 +193,104 @@ def heat_sections(path, pages):
         (15, 0, 26, "폭염 더운 시간대 야외활동", "더운 시간대에는", "폭염 관련 특히"),
         (15, 0, 26, "폭염 노인 야외활동", "노인\n", "어린이\n"),
     ]
+
+    # 3. 이미 추출한 PDF 반쪽 면의 본문을 저장할 딕셔너리를 생성한다.
+    # 동일한 페이지를 반복해서 읽는 작업을 방지하여 처리 효율을 높인다.
     halves = {}
+
+    # 4. PDF 파일을 열고 정의된 추출 범위를 순서대로 처리한다.
+    # with문을 사용하여 작업이 끝나거나 오류가 발생하면 파일을 자동으로 닫는다.
     with pdfplumber.open(path) as book:
         for page_no, side, printed, heading, start, end in excerpts:
+            
+            # 5. PDF 면 번호와 좌우 방향을 조합하여 고유한 식별 키를 생성한다.
+            # 이미 추출한 영역은 다시 읽지 않고 저장된 본문을 재사용한다.
             key = (page_no, side)
+
             if key not in halves:
+                # 6. PDF의 해당 페이지를 가져오고 가로 너비의 절반을 계산한다.
+                # 리스트의 인덱스는 0부터 시작하므로 페이지 번호에서 1을 뺀다.
                 page = book.pages[page_no - 1]
                 mid = page.width / 2
+
+                # 7. 펼침면을 왼쪽 또는 오른쪽 영역으로 잘라낸다.
+                # 두 페이지의 텍스트가 서로 섞여 추출되는 문제를 방지한다.
                 crop = page.crop((side * mid, 0, (side + 1) * mid, page.height))
+
+                # 8. 잘라낸 영역에서 텍스트를 추출한다.
+                # x_tolerance와 y_tolerance는 글자의 가로·세로 간격 허용 범위를 설정한다.
+                # 추출 결과가 None이면 빈 문자열로 처리한다.
                 text = crop.extract_text(x_tolerance=2, y_tolerance=3) or ""
+
+
+                # 9. 추출한 텍스트를 마지막 줄바꿈을 기준으로 본문과 하단 쪽수로 분리한다.
                 body, footer = text.strip().rsplit("\n", 1)
+
+                # 10. 실제 하단 쪽수가 지정한 인쇄 쪽수와 일치하는지 확인한다.
+                # PyPDFLoader로 읽은 동일한 PDF 면에 본문이 존재하는지도 확인한다.
+                # 두 조건 중 하나라도 충족하지 못하면 잘못된 문서 추출을 방지하기 위해
+                # ValueError를 발생시킨다.
                 if footer.strip() != str(printed) or not pages[page_no - 1].page_content.strip():
                     raise ValueError(f"PDF {page_no}면 / 인쇄 {printed}쪽 대조 실패")
-                # PDF 장식용 글리프와 글머리 뒤 첫 음절의 잘못된 공백만 정리한다.
-                body = re.sub(r"(?m)^([•\x1a]) ([가-힣]) ([가-힣])", r"\1 \2\3", body)
+
+                # 11. 정규표현식(re)을 사용하여 PDF 텍스트 추출 과정에서 발생한
+                # 글머리 뒤 한글 음절 사이의 불필요한 공백을 제거한다.
+                body = re.sub(r"(?m)^([•**\x1a**]) ([가-힣]) ([가-힣])", r"\1 \2\3", body)
+
+                # 12. 비정상적으로 추출된 장식용 제어문자를 정상적인 글머리 기호로 변환한다.
+                # 정리된 본문을 딕셔너리에 저장하여 이후 검색 구간에서 재사용한다.
                 halves[key] = body.replace("\x1a", "•")
+
+            # 13. between() 함수를 통해 지정된 시작과 종료 범위의 본문을 추출한다.
+            # make_section() 함수로 본문과 출처 정보를 Document 객체로 구성한다.
+            # yield를 사용하여 생성된 문서 객체를 하나씩 반환한다.
             yield make_section(HEAT, page_no, heading, between(halves[key], start, end), printed)
 
 
 
-
+# %% 풍수해·대설·한파 안전 행동 요령 기사 추출 함수
+# 재난 안전 관련 기사에서 필요한 행동 요령을 항목별로 추출하고 출처 정보를 포함한 RAG 검색용 데이터로 변환하는 함수.
 def article_sections(filename, pages):
     """기사 원문의 문단·번호별로 나눈다. 각 인용의 실제 PDF 면을 따라간다."""
+
+    # 1. 풍수해 기사에서 기상정보 확인 및 대피 관련 내용을 추출한다.
     if filename == STORM:
         first, second = (p.page_content for p in pages[:2])
         general = between(first, "이에 따라 도는 도민 스스로 기상정보", "이를 위해")
         yield make_section(STORM, 1, "풍수해 기상정보와 대피", general)
+        
+        # 2. 풍수해 행동 요령을 다섯 항목으로 분리하고 검증한 후,
+        # 호우와 강풍 관련 안전 수칙으로 분류하여 저장한다.
         actions = between(first, "주요 행동요령은", "특히 어르신에게는").split("▲")[1:]
         if len(actions) != 5:
             raise ValueError("풍수해 행동요령 다섯 항목을 확인해 주세요.")
         for position, body in enumerate(actions):
             heading = "호우 위험지역과 대피" if position < 3 else "강풍 낙하물 위험"
             yield make_section(STORM, 1, heading, body)
+        
+        # 3. 어르신의 이동 및 대피 수칙과 재난문자 관련 내용을 추가로 추출한다.
         seniors = between(first, "특히 어르신에게는", "또한 도는")
         yield make_section(STORM, 1, "호우 어르신 이동과 대피", seniors)
         yield make_section(STORM, 2, "풍수해 재난문자와 대피", between(second, "김규식", "위 기사는"))
         return
 
+    # 4. 대설·한파 기사에서 불필요한 부가 정보를 제외하고
+    # 행동 요령을 번호별로 분리하여 1~6번 항목이 모두 존재하는지 검증한다.
     for page_no, section, stop in [(2, "대설", "한파주의보 행동 요령"), (3, "한파", None)]:
         text = re.split(r"(?m)^\d{2}\.\s*\d{1,2}\.\s*\d{1,2}\.", pages[page_no - 1].page_content)[0]
         body = between(text, "1. ", stop)
         items = re.split(r"(?m)^(\d+)\.\s+", body)
+
         if items[1::2] != list("123456"):
             raise ValueError(f"{section} 행동요령 1~6번을 확인해 주세요.")
+        
+        # 5. 추출한 행동 요령을 대설, 한파, 빙판길 안전 보행으로 분류하고
+        # 출처 정보를 포함한 RAG 검색용 문서 객체로 반환한다.
         for number, item in zip(items[1::2], items[2::2]):
             heading = "빙판길 안전 보행" if section == "한파" and number == "4" else section + " 행동 요령"
             yield make_section(WINTER, page_no, heading, number + ". " + item)
+
+    # 6. 겨울철 기상정보 및 한파 쉼터 관련 안내를 추출하여 반환한다.
     shelter = between(pages[3].page_content, "대설과 한파는", "경기도는")
     yield make_section(WINTER, 4, "겨울 대설 한파 쉼터", shelter)
 
