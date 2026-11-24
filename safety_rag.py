@@ -26,7 +26,8 @@ Windows PowerShell (기존 Python 3.14.6, Intel Arc 140T, .venv-xpu)
 device는 이 프로세스의 문서·질문 임베딩에 적용된다. 학교 서버의 Ollama 주소·모델과는 별도다.
 PDF는 이 파일 옆 data/safety에, 영구 색인은 .safemate/chroma에 둔다.
 """
-# 함수내에 라이브러리 갖고옴
+# %% 공통 라이브러리 불러오기
+# 핵심 요약: 여러 함수에서 공통으로 사용하는 Python 표준 라이브러리와 LangChain 타입을 불러온다.
 import argparse
 import hashlib
 import json
@@ -84,7 +85,10 @@ TOPIC_TERMS = {
     "폭염": r"폭염|온열|무더|더위|덥|더[운워울웠]|뜨거운|한여름|열대야|햇볕|양산",
     "한파": r"한파|혹한|겨울|추위|춥|추[운워울웠]|영하|방한|동파",
     "대설": r"대설|폭설|겨울|눈길|눈(?:이|은|도)?\s*(?:(?:많이|계속|펑펑|조금|잔뜩)\s*)?(?:오|올|왔|와|내리|내려|내릴|쌓|녹)|적설|제설|빙판|결빙|얼[었어]|미끄",
-    "호우": r"호우|폭우|비바람|태풍|장마|집중강우|빗물|침수|하천|강변|빗길|(?:^|\s)비(?:가|는|를|\s*(?:오|올|내))",
+    # (수정) "비 와요", "비 와서"처럼 '와·왔'으로 이어지는 일상 표현도 호우로 인식한다.
+    # 기존에는 '오·올·내'만 허용해 이런 질문이 재난 미식별(insufficient_evidence)로 끝났다.
+    # 대설의 "눈이 와요" 표현과 같은 활용형(왔·와)을 맞춘 것이며, 다른 재난 표현은 그대로 둔다.
+    "호우": r"호우|폭우|비바람|태풍|장마|집중강우|빗물|침수|하천|강변|빗길|(?:^|\s)비(?:가|는|를|\s*(?:오|올|왔|와|내))",
     "강풍": r"강풍|돌풍|바람|낙하물|태풍",
 }
 RELATED = {"폭염": ["폭염"], "한파": ["한파", "빙판길", "겨울"],
@@ -99,6 +103,7 @@ class SafetyError(Exception):
     def __init__(self, status: str, message: str):
         super().__init__(message)
         self.status = status
+
 
 
 
@@ -124,6 +129,7 @@ def matches_approved_pdf(path: Path) -> bool:
 
 
 
+
 # %% 문서의 특정 구간 추출 함수
 def between(text, start, stop=None):
     """확인한 제목·문단 경계가 바뀌면 인용을 중단한다."""
@@ -138,6 +144,7 @@ def between(text, start, stop=None):
     # 3. 시작 위치부터 종료 위치 직전까지의 텍스트를 추출한다.
     # strip()으로 앞뒤의 불필요한 공백과 줄바꿈을 제거한 후 반환한다.
     return text[begin:end].strip()
+
 
 
 
@@ -168,6 +175,7 @@ def make_section(filename, pdf_page, heading, body, printed_page=None):
     # 정리된 본문과 출처 정보를 Document 객체로 묶어 반환한다.
     # 이를 통해 RAG 검색 결과에서 문서의 내용과 출처를 함께 확인할 수 있다.
     return Document(page_content=" ".join(body.split()), metadata=metadata)
+
 
 
 
@@ -235,7 +243,7 @@ def heat_sections(path, pages):
 
                 # 11. 정규표현식(re)을 사용하여 PDF 텍스트 추출 과정에서 발생한
                 # 글머리 뒤 한글 음절 사이의 불필요한 공백을 제거한다.
-                body = re.sub(r"(?m)^([•**\x1a**]) ([가-힣]) ([가-힣])", r"\1 \2\3", body)
+                body = re.sub(r"(?m)^([•\x1a]) ([가-힣]) ([가-힣])", r"\1 \2\3", body)
 
                 # 12. 비정상적으로 추출된 장식용 제어문자를 정상적인 글머리 기호로 변환한다.
                 # 정리된 본문을 딕셔너리에 저장하여 이후 검색 구간에서 재사용한다.
@@ -245,6 +253,7 @@ def heat_sections(path, pages):
             # make_section() 함수로 본문과 출처 정보를 Document 객체로 구성한다.
             # yield를 사용하여 생성된 문서 객체를 하나씩 반환한다.
             yield make_section(HEAT, page_no, heading, between(halves[key], start, end), printed)
+
 
 
 
@@ -297,34 +306,62 @@ def article_sections(filename, pages):
 
 
 
+# %% 공식 안전 행동 요령 PDF 로드 및 문서 추출 함수
+# 승인된 PDF 파일을 불러와 재난 유형별 안전 수칙을 추출하고 RAG 검색용 문서 목록으로 통합하는 함수.
 def load_sections(data_dir):
     """승인 파일 세 개만 PyPDFLoader로 면별 로드한다."""
     from langchain_community.document_loaders import PyPDFLoader
 
+    # 1. 공식 PDF에서 추출한 행동 요령 문단을 보관할 리스트를 생성한다.
     sections = []
+
+    # 2. SOURCES에 등록된 공식 문서만 순차적으로 불러오고,
+    # 해당 PDF 파일이 실제로 존재하는지 확인한다.
     for filename in SOURCES:
         path = Path(data_dir) / filename
         try:
             if not path.is_file():
                 raise FileNotFoundError(path)
+
+            # 2-1. PDF 파일명뿐 아니라 승인한 판본의 SHA-256 해시값도 확인한다.
+            # 내용이 변경된 문서를 검색 근거로 사용하지 않도록 문서 로딩을 중단한다.
+            if not matches_approved_pdf(path):
+                raise SafetyError("document_error", f"{filename} PDF가 승인된 원본과 일치하지 않습니다.")
+
+            # 3. PDF를 페이지 단위로 읽고 문서 유형에 따라
+            # 폭염 또는 풍수해·대설·한파 전용 추출 함수를 실행한다.
+            # 추출된 문서들은 하나의 리스트로 통합한다.
             pages = PyPDFLoader(str(path), mode="page").load()
             selected = heat_sections(path, pages) if filename == HEAT else article_sections(filename, pages)
             sections.extend(selected)
+
+        # 4. 파일 누락, 본문 추출 실패, 판본 불일치 등의 오류가 발생하면
+        # SafetyError를 발생시켜 잘못된 문서가 RAG에 사용되는 것을 방지한다.
         except Exception as error:
             raise SafetyError("document_error", f"{filename} PDF의 파일·본문·판본을 확인해 주세요. {error}") from error
+
+    # 5. 모든 공식 문서에서 추출한 안전 행동 요령을 반환한다.
     return sections
 
 
 
 
+# %% RAG 문서 청크 분할 및 검색 정보 구성 함수
+# 핵심 요약: 안전 행동 요령 문서를 검색하기 적절한 크기로 나누고, 검색용 제목과 실제 인용할 원문을 구분하여 저장하는 함수.
 def split_sections(sections):
     """검색용 소제목과 실제 인용할 원문을 구분해 보관한다."""
+    
+    # 1. 문서를 작은 단위로 분할하기 위한 텍스트 분할기를 불러온다.
+    # 청크 크기, 중복 범위, 분할 기준을 설정하여 문맥이 최대한 유지되도록 한다.
     from langchain_text_splitters import RecursiveCharacterTextSplitter
 
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE, chunk_overlap=OVERLAP, separators=SEPARATORS
     )
     chunks = splitter.split_documents(sections)
+    
+    # 2. 실제 인용할 원문은 메타데이터에 별도로 보존하고,
+    # 검색용 본문에는 소제목을 추가하여 검색 시 주제를 파악하기 쉽게 만든다.
     for chunk in chunks:
         chunk.metadata["excerpt"] = chunk.page_content
         chunk.page_content = chunk.metadata["heading"] + "\n" + chunk.page_content
@@ -334,12 +371,18 @@ def split_sections(sections):
 
 
 # %% 임베딩 장치와 모델
+# 핵심 요약: 임베딩에 사용할 CPU 또는 GPU가 정상적으로 작동하는지 실제 연산을 통해 검증하는 함수.
 def configure_embedding_device(requested: str) -> str:
     """선택한 장치에서 작은 텐서 연산을 실행하고 실제 장치 이름을 돌려준다."""
+
+    # 1. 사용자가 지정한 연산 장치가 지원되는 종류인지 확인한다.
+    # cuda는 NVIDIA GPU, xpu는 Intel GPU, cpu는 CPU 연산을 의미한다.
     if requested not in ("cuda", "xpu", "cpu"):
         raise SafetyError("device_error", "장치는 cuda, xpu, cpu 중 하나를 지정해 주세요.")
     import torch
 
+    # 2. 지정된 장치를 PyTorch에서 사용할 수 있는지 확인하고,
+    # 실제 임베딩 연산에 사용할 장치를 설정한다.
     try:
         if requested == "cpu":
             device = torch.device("cpu")
@@ -348,43 +391,65 @@ def configure_embedding_device(requested: str) -> str:
             if backend is None or not backend.is_available():
                 raise RuntimeError("PyTorch가 이 GPU를 인식하지 못했습니다.")
             device = torch.device(requested, backend.current_device())
+
+        # 3. 선택한 장치에서 간단한 텐서 연산을 실행하여
+        # 실제 연산 장치와 계산 결과가 정상적인지 검증한다.
         probe = torch.ones(2, device=device).sum()
         if probe.device != device or probe.item() != 2:
             raise RuntimeError("텐서의 장치 또는 연산 결과가 예상과 다릅니다.")
+
+    # 4. 장치 인식 또는 연산 과정에서 오류가 발생하면
+    # 임베딩 작업을 중단하고 PyTorch와 드라이버 확인을 안내한다.
     except Exception as error:
         raise SafetyError("device_error", f"{requested} 장치 확인 실패. PyTorch 빌드와 드라이버를 확인해 주세요. {error}") from error
+
+    # 5. 검증이 완료된 장치의 이름을 반환한다.
     return str(device)
 
 
 
 
+# %% 임베딩 모델의 실제 연산 장치 검증 함수
+# 핵심 요약: 임베딩 모델이 지정된 CPU 또는 GPU에서 실제로 연산하는지 확인하고, 생성된 벡터의 차원과 장치 정보를 검증하는 함수.
 def verify_embedding_device(encoder, selected: str) -> dict:
     """가중치 전체, 토큰 임베딩 연산의 입출력, 최종 문장 벡터를 실제 한 문장으로 확인한다."""
     import torch
 
+    # 1. 임베딩 모델의 모든 가중치가 지정된 연산 장치에 존재하는지 검증한다.
+    # 실제 장치와 선택한 장치가 일치하지 않으면 오류를 발생시킨다.
     weights = {str(parameter.device) for parameter in encoder.parameters()}
     if weights != {selected}:
         raise ValueError(f"선택 장치 {selected}, 실제 모델 가중치 {sorted(weights)}")
 
+    # 2. 모델 내부의 단어 임베딩 연산에서 입력과 출력이
+    # 어떤 장치에서 처리되는지 기록하기 위한 관찰 함수를 정의한다.
     token_devices = {}
 
     def record_token_devices(layer, inputs, output):
         token_devices["token_input"] = str(inputs[0].device)
         token_devices["token_output"] = str(output.device)
 
-    # MiniLM의 단어 임베딩 층에 한 번만 관찰 함수를 건다. with를 벗어나면 자동으로 제거된다.
+    # 3. MiniLM 모델의 단어 임베딩 층에 관찰 함수(Forward Hook)를 연결한다.
+    # 실제 문장을 임베딩하여 연산 장치를 확인하고, 검증이 끝나면 관찰 함수를 자동으로 제거한다.
     word_embeddings = encoder[0].auto_model.get_input_embeddings()
     with word_embeddings.register_forward_hook(record_token_devices):
         vector = encoder.encode("외출 안전", convert_to_tensor=True, normalize_embeddings=NORMALIZE)
 
+    # 4. 토큰 임베딩의 입출력과 최종 문장 벡터가 지정된 장치에 존재하는지 확인한다.
+    # 최종 벡터가 모델의 출력 규격인 384차원과 일치하는지도 검증한다.
     expected = {"token_input": selected, "token_output": selected}
     if token_devices != expected or str(vector.device) != selected or vector.shape != (384,):
         raise ValueError(f"임베딩 장치·차원 불일치. 선택 {selected}, 토큰 {token_devices}, 출력 {vector.device} {vector.shape}")
 
+    # 5. 검증된 연산 장치의 종류와 실제 GPU 이름을 확인한다.
+    # CPU를 사용하는 경우 GPU 이름은 None으로 유지한다.
     device = torch.device(selected)
     gpu_name = None
     if device.type != "cpu":
         gpu_name = getattr(torch, device.type).get_device_name(device.index)
+
+    # 6. 모델 가중치, 토큰 입출력, 최종 임베딩 장치, 벡터 차원,
+    # GPU 이름 및 PyTorch 버전 등 검증 결과를 딕셔너리로 반환한다.
     return {
         "requested": device.type, "weights": next(iter(weights)), **token_devices,
         "embedding": str(vector.device), "dimensions": vector.numel(),
@@ -393,54 +458,92 @@ def verify_embedding_device(encoder, selected: str) -> dict:
 
 
 
-
+# %% 임베딩 모델 로딩 및 연산 장치 검증 함수
+# 핵심 요약: 지정된 연산 장치에 임베딩 모델을 불러오고 정상 작동 여부를 검증한 후 모델을 재사용할 수 있도록 관리하는 함수.
 @lru_cache(maxsize=3)
 def load_embeddings(device: str):
     """장치별 모델을 한 번 준비하고 모델과 검증 정보를 함께 재사용한다."""
+
+    # 1. 사용자가 지정한 연산 장치의 정상 작동 여부를 확인하고,
+    # HuggingFace 임베딩 모델을 사용하기 위한 라이브러리를 불러온다.
+    # lru_cache를 통해 최대 3개의 모델 로딩 결과를 보관하여 반복 로딩을 방지한다.
     selected = configure_embedding_device(device)
     from langchain_huggingface import HuggingFaceEmbeddings
 
+    # 2. 지정된 모델과 버전을 선택한 연산 장치에 불러온다.
+    # 임베딩 벡터의 정규화 여부를 설정하고, 한 번에 8개의 데이터를 처리하도록 구성한다.
     try:
         model = HuggingFaceEmbeddings(
             model_name=MODEL,
             model_kwargs={"device": selected, "revision": REVISION},
             encode_kwargs={"normalize_embeddings": NORMALIZE, "batch_size": 8},
         )
+
+        # 3. 모델 내부의 실제 인코더를 대상으로 검증 함수를 실행하여
+        # 지정된 장치에서 임베딩 연산이 정상적으로 수행되는지 확인한다.
         # 고정한 langchain-huggingface 버전에서 실제 인코더는 _client에 들어 있다.
         details = verify_embedding_device(model._client, selected)
+
+    # 4. 모델 다운로드, 메모리 부족 또는 지원하지 않는 연산 등의 문제가 발생하면
+    # SafetyError를 발생시켜 오류 원인 확인을 안내한다.
     except Exception as error:
         raise SafetyError("model_error", f"{selected} 모델 로딩·추론 실패. 다운로드·메모리·지원 연산을 확인해 주세요. {error}") from error
+
+    # 5. 검증이 완료된 임베딩 모델과 연산 장치 정보를 반환한다.
     return model, details
 
 
 
-
 # %% Chroma 영구 색인
+# 핵심 요약: 원본 PDF와 RAG 설정의 고유 식별값을 생성하여 기존 벡터 DB의 재사용 여부를 판단할 수 있도록 하는 함수.
 def corpus_key(data_dir):
     """PDF 바이트·전처리 규칙·임베딩 설정·관련 패키지 버전으로 저장소를 구분한다."""
+
+    # 1. 원본 문서 정보, 임베딩 모델, 청크 분할 기준,
+    # 유사도 계산 방식 및 관련 라이브러리 버전을 하나의 설정으로 구성한다.
     config = {"schema": 3, "sources": SOURCES, "model": MODEL, "revision": REVISION,
               "split": [CHUNK_SIZE, OVERLAP], "separators": SEPARATORS, "normalized": NORMALIZE, "metric": "cosine",
               "packages": {p: version(p) for p in ("pypdf", "pdfplumber", "langchain-text-splitters",
                            "sentence-transformers", "transformers", "langchain-huggingface", "chromadb", "langchain-chroma")}}
+
+    # 2. SHA-256 해시 알고리즘을 사용하여 설정의 고유 식별값을 생성하고,
+    # 중복 PDF를 확인하기 위한 집합을 준비한다.
     digest = hashlib.sha256(json.dumps(config, sort_keys=True).encode())
     seen = set()
+
+    # 3. 승인된 PDF 파일을 순차적으로 읽어 각 파일의 고유 해시값을 계산한다.
+    # 파일이 누락되거나 읽을 수 없는 경우 오류를 발생시킨다.
     for filename in SOURCES:
         try:
             with (Path(data_dir) / filename).open("rb") as pdf:
                 signature = hashlib.file_digest(pdf, "sha256").digest()
         except OSError as error:
             raise SafetyError("document_error", f"{filename} 파일을 읽을 수 없습니다. {error}") from error
+
+        # 3-1. 기존 Chroma 색인을 재사용할 때도 승인된 PDF 판본인지 확인한다.
+        # 해시값이 다르면 잘못된 공식 문서가 사용되지 않도록 색인 준비를 중단한다.
+        if signature.hex() != APPROVED_SHA256[filename]:
+            raise SafetyError("document_error", f"{filename} PDF의 SHA-256이 승인된 원본과 일치하지 않습니다.")
+
+        # 4. 동일한 내용의 PDF가 중복 등록되었는지 검증하고,
+        # 각 PDF의 해시값을 전체 식별값 계산에 반영한다.
         if signature in seen:
             raise SafetyError("document_error", f"{filename} 자리에 다른 승인 PDF의 복사본이 있습니다.")
         seen.add(signature)
         digest.update(signature)
+
+    # 5. 원본 PDF와 RAG 설정이 모두 반영된 최종 해시값을 반환한다.
+    # 문서나 설정이 변경되면 다른 식별값이 생성되어 기존 색인과 구분할 수 있다.
     return digest.hexdigest()
 
 
 
 
+# %% 코사인 거리를 검색 유사도 점수로 변환하는 함수
+# 핵심 요약: 벡터 간 거리가 작을수록 더 높은 검색 점수를 부여한다.
 def cosine_score(distance):
     """Chroma의 코사인 거리를 0~1 범위의 검색 점수로 바꾼다."""
+    # 1. 코사인 거리를 1에서 빼 유사도로 변환하고 0~1 범위를 벗어나지 않게 한다.
     return max(0.0, min(1.0, 1.0 - distance))
 
 
@@ -459,12 +562,21 @@ class SafetyIndex:
 
 
 
+# %% RAG 벡터 데이터베이스 연결 및 유사도 관리 함수
+# 핵심 요약: 임베딩 모델과 벡터 DB를 연결하고, 기존 연결을 재사용하며 검색된 문서의 유사도 점수를 함께 관리하는 함수.
+
 @lru_cache(maxsize=3)
 def open_safety_store(path, device):
     """동일 경로·장치의 연결을 공유한다. 코사인 점수는 같은 검색에서 한 번만 계산한다."""
+
+    # 1. 벡터 데이터베이스 연결 및 환경 설정에 필요한 라이브러리를 불러온다.
+    # lru_cache를 사용하여 최대 3개의 연결을 캐시에 보관하고 재사용한다.
     from chromadb.config import Settings
     from langchain_chroma import Chroma
 
+    # 2. 기존 Chroma 클래스를 상속하여 검색 기능을 확장한다.
+    # 검색 과정에서 계산된 유사도 점수를 문서의 메타데이터에 저장하여
+    # 이후 검색 결과를 평가할 때 유사도를 다시 계산하지 않도록 한다.
     class ScoredChroma(Chroma):
         """공개 Retriever가 계산한 점수를 같은 검색의 Document에 담는다."""
         def similarity_search_with_relevance_scores(self, query, k=4, **kwargs):
@@ -473,6 +585,9 @@ def open_safety_store(path, device):
                 doc.metadata["similarity"] = round(score, 4)
             return matches
 
+    # 3. 지정된 연산 장치에서 임베딩 모델을 불러오고 벡터 DB와 연결한다.
+    # 익명 사용 통계 수집을 비활성화하고, 코사인 거리 기반 검색을 설정한다.
+    # 생성된 DB 연결 객체는 이후 문서 저장 및 RAG 검색에 사용된다.
     model, _ = load_embeddings(device)
     return ScoredChroma(
         collection_name="outing_safety",
@@ -485,11 +600,15 @@ def open_safety_store(path, device):
 
 
 
-
+# %% RAG 벡터 데이터베이스 색인 준비 함수
+# 핵심 요약: 공식 안전 문서를 임베딩하여 벡터 DB를 구축하고, 기존 색인이 유효하면 재사용하여 RAG 검색을 준비하는 함수.
 def prepare_safety_index(
     device: str, *, data_dir: str | Path | None = None, cache_dir: str | Path | None = None
 ) -> SafetyIndex:
     """선택한 장치에서 색인을 한 번 준비한다. 문서·모델·저장 오류는 SafetyError로 전달한다."""
+
+    # 1. 문서와 캐시 저장 경로를 설정하고, 원본 문서의 고유 식별값을 생성한다.
+    # 이를 통해 문서의 변경 여부를 구분하고 임베딩 모델 및 연산 장치를 준비한다.
     from filelock import FileLock
 
     data_dir = DATA_DIR if data_dir is None else Path(data_dir)
@@ -498,20 +617,32 @@ def prepare_safety_index(
     path = cache_dir.resolve() / fingerprint
     marker = path / "ready.json"
     _, device_info = load_embeddings(device)
+
+    # 2. 벡터 DB 저장 공간을 생성하고 파일 잠금 기능을 적용한다.
+    # 여러 프로세스가 동시에 색인을 구축하여 데이터가 손상되는 것을 방지한다.
     try:
         path.mkdir(parents=True, exist_ok=True)
         with FileLock(str(path / "build.lock"), timeout=120):
             store = open_safety_store(path, device)
+
+            # 3. 기존 벡터 DB와 색인 완료 기록을 비교하여 재사용 가능 여부를 판단한다.
+            # 기존 청크 목록이 기록과 일치하면 불필요한 임베딩 작업을 생략한다.
             existing = set(store.get(include=[])["ids"])
             try:
                 ready = json.loads(marker.read_text(encoding="utf-8"))
             except (FileNotFoundError, ValueError):
                 ready = []
             reused = bool(existing) and sorted(existing) == ready
+
+            # 4. 기존 색인을 재사용할 수 없다면 공식 문서를 불러와 청크로 분할한다.
+            # 색인 준비 도중 원본 PDF가 변경되었는지도 검증한다.
             if not reused:
                 chunks = split_sections(load_sections(data_dir))
                 if corpus_key(data_dir) != fingerprint:
                     raise SafetyError("document_error", "색인 준비 중 PDF가 변경되었습니다. 다시 시작해 주세요.")
+
+                # 5. 각 청크에 고유 ID를 부여하고 불필요한 기존 데이터를 삭제한다.
+                # 새로운 청크를 임베딩하여 벡터 DB에 저장하고 저장 결과를 검증한다.
                 ids = [f"chunk-{i:04}" for i in range(len(chunks))]
                 extra = existing.difference(ids)
                 if extra:
@@ -519,22 +650,35 @@ def prepare_safety_index(
                 store.add_documents(chunks, ids=ids)
                 if set(store.get(include=[])["ids"]) != set(ids):
                     raise ValueError("저장 후 청크 목록이 일치하지 않습니다.")
+
+                # 6. 색인 구축이 정상적으로 완료되면 청크 목록을 기록한다.
+                # 임시 파일에 먼저 저장한 후 완료 기록 파일로 교체하여 기록 손상 위험을 줄인다.
                 temp = marker.with_suffix(".tmp")
                 temp.write_text(json.dumps(sorted(ids)), encoding="utf-8")
                 temp.replace(marker)
                 ready = ids
+
+    # 7. 색인 구축 과정에서 발생하는 오류를 처리한다.
+    # 문서, 모델 연산, DB 저장 경로 및 쓰기 권한 등의 문제를 안내한다.
     except SafetyError:
         raise
     except Exception as error:
         raise SafetyError("index_error", f"색인 준비 실패. 모델 연산·DB 경로·쓰기 권한을 확인해 주세요. {error}") from error
+
+    # 8. 유사도 기반 검색기를 생성한다.
+    # 최대 8개의 검색 후보 중 설정된 최소 유사도 기준을 충족하는 문서를 검색하도록 구성한다.
     retriever = store.as_retriever(search_type="similarity_score_threshold",
                                    search_kwargs={"k": 8, "score_threshold": MIN_SIMILARITY})
+
+    # 9. 검색기, 연산 장치 정보, 청크 개수, 색인 재사용 여부,
+    # 저장 경로를 하나의 SafetyIndex 객체로 묶어 반환한다.
     return SafetyIndex(retriever, dict(device_info), len(ready), reused, path)
 
 
 
 
-# %% 질문 → 근거 검색 결과
+# %% 질문과 관련된 안전 행동 요령 문단의 우선순위 정렬 함수
+# 핵심 요약: 검색된 문단에서 질문과 일치하는 단어를 확인해 관련성이 높은 원문을 우선 선택한다.
 def rank_passages(question, documents):
     """의미 검색 후보 안에서 질문의 구체적인 단어가 원문에도 있는 문단을 우선한다."""
     # 한국어 조사가 붙은 '하천으로'도 '하천'과 비교한다. 두 음절 단서는 보조 지표다.
@@ -557,25 +701,52 @@ def rank_passages(question, documents):
 
 
 
+# %% RAG 기반 외출 안전 행동 요령 검색 함수
+# 핵심 요약: 사용자의 질문에서 재난 유형을 파악하고 관련 공식 안전 수칙을 검색하여 원문과 출처 정보를 반환하는 함수.
 def search_safety_guidance(question: str | None, index: SafetyIndex) -> dict:
     """준비된 색인에 질문하고 status, message, count, results를 반환한다."""
+
+    # 1. 검색 상태, 안내 메시지, 검색 결과 개수와 내용을
+    # 일정한 딕셔너리 형식으로 반환하기 위한 내부 함수를 정의한다.
     def result(status, message, items):
         return {"status": status, "message": message, "count": len(items), "results": items}
 
+    # 2. 사용자 질문의 유효성을 확인하고 재난 유형을 파악한다.
+    # 질문이 비어 있거나 재난 유형을 식별하지 못하면 추가 정보 입력을 안내한다.
     if not isinstance(question, str) or not question.strip():
         return result("needs_input", "외출 안전에 관해 궁금한 점을 입력해 주세요.", [])
     topics = [name for name, pattern in TOPIC_TERMS.items() if re.search(pattern, question)]
     if not topics:
         return result("insufficient_evidence", "질문에서 검색할 재난을 식별하기 어렵습니다. 날씨나 도로 상태를 알려 주세요.", [])
+
+    # 3. 식별된 재난 유형을 바탕으로 관련 검색 범위를 설정하고,
+    # 기존 질문에 재난 주제를 추가하여 검색용 질문을 구성한다.
     allowed = sorted({tag for topic in topics for tag in RELATED[topic]})
     query = " ".join(topics) + " " + question.strip()
+
+    # 4. LangSmith 추적 기능을 비활성화한 상태에서 벡터 검색을 실행한다.
+    # 관련 재난 유형의 문서만 검색하며, 검색 실패 시 오류 메시지를 반환한다.
     try:
         from langsmith import tracing_context
 
         with tracing_context(enabled=False):
-            documents = index.retriever.invoke(query, filter={"topic": {"$in": allowed}})
+            # 4-1. 기존 Retriever의 유사도 기준과 검색 개수는 그대로 유지한다.
+            # invoke()에 필터를 전달하면 검색 도구에서 무시될 수 있으므로,
+            # 이번 질문에 맞는 재난 주제 필터를 검색기 생성 옵션에 지정한다.
+            filtered_retriever = index.retriever.vectorstore.as_retriever(
+                search_type=index.retriever.search_type,
+                search_kwargs={
+                    **index.retriever.search_kwargs,
+                    "filter": {"topic": {"$in": allowed}},
+                },
+            )
+            documents = filtered_retriever.invoke(query)
     except Exception as error:
         return result("search_error", f"질문 임베딩 또는 벡터 검색 실패. {error}", [])
+
+    # 5. 검색된 문서의 관련성을 평가하고 순위를 정리한다.
+    # 실제 원문, 발행 기관, URL, 페이지 번호, 유사도 등
+    # 답변의 근거와 출처 확인에 필요한 정보를 결과 목록에 저장한다.
     hits = []
     for document in rank_passages(question, documents):
         metadata = document.metadata
@@ -589,10 +760,12 @@ def search_safety_guidance(question: str | None, index: SafetyIndex) -> dict:
             "printed_page": metadata.get("printed_page"),
             "similarity": metadata["similarity"],
         })
+
+    # 6. 충분한 검색 근거가 없다면 임의로 정보를 생성하지 않고,
+    # 근거 부족 상태를 반환한다. 검색에 성공하면 원문과 출처 정보를 반환한다.
     if not hits:
         return result("insufficient_evidence", "승인된 자료에서 이 질문에 충분한 근거를 찾지 못했습니다.", [])
     return result("ok", "외출 안전 관련 원문을 찾았습니다.", hits)
-
 
 
 
