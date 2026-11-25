@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "description": "SafeMate 가상 사용자(혼자 사는 78세 김○○ 어르신)의 가상 초기 일정입니다. 실제 개인정보가 아닙니다. 날짜는 저장소를 처음 만드는 날을 기준으로 day_offset일을 더해 정합니다.",
+  "schedules": [
+    {"title": "아침 산책", "aliases": ["산책"], "day_offset": 0, "start": "08:00", "minutes": 30,
+     "city": "인천", "category": "outing", "reschedulable": true},
+    {"title": "시장 장보기", "aliases": ["장보기", "장 보기", "시장"], "day_offset": 1, "start": "14:00", "minutes": 60,
+     "city": "인천", "category": "outing", "reschedulable": true},
+    {"title": "복지관 방문", "aliases": ["복지관"], "day_offset": 1, "start": "16:00", "minutes": 60,
+     "city": "인천", "category": "appointment", "reschedulable": false},
+    {"title": "병원 진료", "aliases": ["병원", "진료", "병원 약속"], "day_offset": 3, "start": "10:00", "minutes": 90,
+     "city": "인천", "category": "appointment", "reschedulable": false}
+  ]
+}
