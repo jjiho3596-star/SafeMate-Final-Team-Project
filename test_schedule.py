@@ -19,6 +19,7 @@
 # 핵심 요약: 테스트 대상 모듈과 표준 라이브러리만 쓴다. 테스트 시작 시점의 운영 저장소 상태를 기록해 두었다가 끝에 비교한다.
 import copy
 import hashlib
+import inspect
 import json
 import os
 import re
@@ -34,8 +35,10 @@ from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+import outing_decision as od
 import schedule_service as sv
 import schedule_store as ss
+import test_outing_decision as tod
 from a_outing import KST
 
 ROOT = Path(__file__).resolve().parent
@@ -1280,6 +1283,237 @@ class M_SV9_ReviewRegressions(StoreCase):
         self.assertEqual(got(sv.parse_day("내일모레", FIXED_NOW), "date"), "2026-11-27")
         self.assertEqual(got(sv.parse_day("100주 뒤", FIXED_NOW), "date"), "2028-10-25")
         self.assertIn("ambiguous", sv.parse_clock("오후 2시나 3시") or {})
+
+
+# %% 3단계 의도 분류 보완 테스트 도우미 (구현 단위 3)
+# 핵심 요약: 3단계 테스트의 Harness·FakeLLM·FakeWeather·FakeRAG로 Ollama·날씨·RAG를 가상으로 바꾸고, 실제 3단계 코드를 실행한다.
+OLD_INTENTS = ("weather_question", "outing_consultation", "safety_guidance", "schedule_change", "daily_conversation",
+               "living_support")
+SCHEDULE_HINT = [{"title": "시장 장보기", "date": "2026-11-25", "time": "14:00"},
+                 {"title": "복지관 방문", "date": "2026-11-25", "time": "16:00"}]
+
+
+def run_with_schedule(h: Any, request: Any, state: Any = None, **kwargs) -> dict[str, Any]:
+    """Harness 안에서 run_outing_decision_with_schedule을 실행하고 JSON 직렬화를 확인한다."""
+    kwargs.setdefault("device", "xpu")
+    kwargs.setdefault("index", tod.FAKE_INDEX)
+    result = od.run_outing_decision_with_schedule(request, conversation_state=state, **kwargs)
+    json.dumps(result, ensure_ascii=False, allow_nan=False)
+    return result
+
+
+# %% M-OD1. 3단계 공개 계약 유지 (R1 해시 비교를 대신하는 계약 검사, 요구 32)
+class M_OD1_Contract(unittest.TestCase):
+
+    def test_OD01_public_contract_is_backward_compatible(self):
+        """OD01 기존 run_outing_decision 시그니처·반환 키·decision 키·이해 스키마 키는 그대로이고, 의도는 뒤에만 덧붙였다."""
+        params = inspect.signature(od.run_outing_decision).parameters
+        self.assertEqual(list(params), ["request", "device", "index", "conversation_state"])
+        new = inspect.signature(od.run_outing_decision_with_schedule).parameters
+        self.assertEqual(list(new), ["request", "device", "index", "conversation_state", "schedule_hint", "schedule_handoff"])
+        self.assertEqual(od.INTENTS[:6], OLD_INTENTS)
+        self.assertEqual(od.INTENTS[6:], ("schedule_query", "schedule_create", "schedule_cancel", "schedule_complete",
+                                         "schedule_history"))
+        self.assertEqual(od.ROUTES, od.INTENTS + ("needs_clarification", "error"))
+        self.assertEqual(set(od.UNDERSTANDING_SCHEMA["properties"]),
+                         {"intent", "intent_clear", "answers_previous_question", "user_goal", "needs_weather",
+                          "safety_topics", "city_text", "date_text", "time_text", "appointment_time_text",
+                          "departure_lead_text", "alternative_time_text", "purpose", "can_reschedule",
+                          "user_reported_conditions"})
+        self.assertEqual(od.UNDERSTANDING_SCHEMA["properties"]["intent"]["enum"], list(od.INTENTS))
+        self.assertEqual(len(od.empty_result()), 26)
+
+    def test_OD02_prompt_defines_schedule_intents(self):
+        """OD02 이해 프롬프트가 새 의도 정의와, 실측에서 틀렸던 문장·부정·생활 지원 구분 예시를 담는다."""
+        prompt = od.UNDERSTANDING_PROMPT
+        for name in od.SCHEDULE_INTENTS:
+            self.assertIn(f"- {name}:", prompt)
+        for text in ("비 오면 시간 바꿀까?\" → intent=schedule_change", "바꾸지 마", "네가 알아서 정해 줘",
+                     "우유하고 계란이 떨어졌어\" → intent=living_support", "날씨만 묻는 말은 weather_question"):
+            self.assertIn(text, prompt)
+
+
+# %% M-OD2. 일정 넘김 경로 (요구 18, LLM은 의도만, 일정 변경·승인은 하지 않음)
+class M_OD2_Handoff(unittest.TestCase):
+
+    def test_OD03_new_schedule_intents_hand_off_without_tools(self):
+        """OD03 새 일정 의도 5개: 이해 LLM 1회만, 날씨·RAG·답변 LLM 없음, route=의도, 승인 제안 없음, 외출 slots 오염 없음"""
+        cases = {"schedule_query": "내가 내일 뭐 하기로 했지?", "schedule_create": "내일 아침 여덟 시에 산책할 거야. 기억해 줘.",
+                 "schedule_cancel": "내일 장보기는 안 갈래", "schedule_complete": "오늘 시장 다녀왔어",
+                 "schedule_history": "아까 바꾼 일정 몇 시였지?"}
+        for intent, message in cases.items():
+            for runner in ("old", "new"):
+                with self.subTest(intent=intent, runner=runner), tod.Harness(llm=tod.FakeLLM(
+                        {message: tod.u(intent=intent, date_text="내일" if "내일" in message else "")})) as h:
+                    result = h.run(message) if runner == "old" else run_with_schedule(h, message, schedule_hint=SCHEDULE_HINT)
+                    self.assertEqual((result["status"], result["route"], result["intent"]), ("ok", intent, intent))
+                    self.assertEqual((result["usage"]["llm_calls"], h.weather.calls, h.rag.calls), (1, [], []))
+                    self.assertEqual((result["requires_user_confirmation"], result["proposed_action"]), (False, None))
+                    self.assertEqual(result["decision"]["kind"], "schedule_handoff")
+                    self.assertEqual(result["decision"]["answer_source"], "handoff")
+                    self.assertEqual(set(result["decision"]), {"kind", "suggest_schedule_change", "official_points",
+                                                               "used_fact_ids", "question", "verified", "answer_source"})
+                    self.assertEqual(result["answer"], od.HANDOFF_ANSWER)
+                    state = result["conversation_state"]
+                    self.assertEqual(state["slots"], od.new_conversation_state()["slots"])
+                    self.assertEqual((state["intent"], state["turn"], len(state["history"])), (intent, 1, 2))
+                    self.assertEqual(od.load_conversation_state(state)["intent"], intent)
+
+    def test_OD04_schedule_change_hands_off_only_when_requested(self):
+        """OD04 schedule_change: 기존 함수는 기존대로 예보 비교·제안(3단계 S08), 저장소 연결용 함수는 일정 단계로 넘김"""
+        message = "내일 오후 2시에 인천 가는데 비 오면 시간 바꿀까?"
+        understanding = tod.u(intent="schedule_change", needs_weather=True, city_text="인천", date_text="내일",
+                              time_text="오후 2시")
+        rainy = {14: {"precipitation_mm": 2.0, "precipitation_probability_pct": 80}}
+        with tod.Harness(llm=tod.FakeLLM({message: understanding}), weather=tod.FakeWeather(by_hour=rainy)) as h:
+            old = h.run(message)
+        self.assertEqual((old["route"], old["requires_user_confirmation"]), ("schedule_change", True))
+        self.assertEqual(old["proposed_action"]["type"], "propose_outing_time_change")
+        with tod.Harness(llm=tod.FakeLLM({message: understanding}), weather=tod.FakeWeather(by_hour=rainy)) as h:
+            kept = run_with_schedule(h, message, schedule_handoff=False)
+        self.assertEqual((kept["route"], kept["requires_user_confirmation"]), ("schedule_change", True))
+        with tod.Harness(llm=tod.FakeLLM({message: understanding}), weather=tod.FakeWeather(by_hour=rainy)) as h:
+            handed = run_with_schedule(h, message)
+            self.assertEqual((handed["route"], handed["decision"]["kind"], h.weather.calls), ("schedule_change", "schedule_handoff", []))
+            self.assertEqual((handed["requires_user_confirmation"], handed["proposed_action"]), (False, None))
+
+    def test_OD05_structured_schedule_intent_needs_no_llm(self):
+        """OD05 문장 없이 intent만 넘긴 구조화 요청도 넘김 경로를 쓰고, LLM을 부르지 않는다."""
+        with tod.Harness() as h:
+            result = h.run({"intent": "schedule_query"})
+        self.assertEqual((result["route"], result["usage"]["llm_calls"]), ("schedule_query", 0))
+
+    def test_OD06_other_intents_keep_their_paths(self):
+        """OD06 날씨 질문·안전수칙·생활 지원·일상 대화는 기존 경로 그대로다. (넘김 없음, 저장소 연결용 함수에서도 같음)"""
+        cases = {"내일 인천 비 와?": (tod.u(**tod.WQ, city_text="인천", date_text="내일"), "weather_question"),
+                 "눈길에서는 어떻게 걸어야 해?": (tod.u(intent="safety_guidance", safety_topics=["대설"]), "safety_guidance"),
+                 "우유하고 계란이 떨어졌어": (tod.u(intent="living_support", user_goal="생필품 부족"), "living_support"),
+                 "오늘 심심하다": (tod.u(intent="daily_conversation"), "daily_conversation")}
+        for message, (understanding, route) in cases.items():
+            with self.subTest(message), tod.Harness(llm=tod.FakeLLM({message: understanding})) as h:
+                result = run_with_schedule(h, message, schedule_hint=SCHEDULE_HINT)
+                self.assertEqual(result["route"], route)
+                self.assertNotEqual(result["decision"]["kind"], "schedule_handoff")
+                self.assertNotIn("schedule_handoff", result["llm"]["rules_applied"])
+
+
+# %% M-OD3. 일정 요약 전달과 재확인 신호 (보완 ②: 동사만으로 의도를 확정하지 않음)
+class M_OD3_HintAndRecheck(unittest.TestCase):
+
+    def test_OD07_schedule_hint_reaches_understanding_only_when_given(self):
+        """OD07 저장된 일정 요약은 제목·날짜·시각만, 최대 8개, 형식이 틀린 항목은 버리고 이해 단계 자료에 넣는다."""
+        message = "시장 가는 거 몇 시였지?"
+        hint = SCHEDULE_HINT + [{"title": "x" * 50, "date": "d", "time": "t"}, ["잘못된"], {"title": "id만"}] + \
+            [{"title": f"일정{i}", "date": "2026-11-26", "time": "09:00", "schedule_id": "schedule_001"} for i in range(10)]
+        with tod.Harness(llm=tod.FakeLLM({message: tod.u(intent="schedule_query")})) as h:
+            run_with_schedule(h, message, schedule_hint=hint)
+            context = h.llm.stage_calls("understanding")[0]["context"]
+        listed = context["등록된_일정"]
+        self.assertEqual(len(listed), 8)
+        self.assertEqual(listed[0], {"제목": "시장 장보기", "날짜": "2026-11-25", "시각": "14:00"})
+        self.assertTrue(all(set(item) == {"제목", "날짜", "시각"} for item in listed))
+        with tod.Harness(llm=tod.FakeLLM({message: tod.u(intent="schedule_query")})) as h:
+            h.run(message)
+            self.assertNotIn("등록된_일정", h.llm.stage_calls("understanding")[0]["context"])
+
+    def test_OD08_recheck_signal_never_changes_intent(self):
+        """OD08 모델이 날씨 질문으로 분류한 일정 변경 모양 문장은 재확인 신호만 남기고, 의도·경로는 바꾸지 않는다."""
+        cases = {"내일 시장 가는 시간 바꿔 줘, 비 와?": True, "내일 일정 바꾸지 마, 비 온대?": True,
+                 "시장 장보기 미뤄야 하나? 비 오나?": True, "옷 바꿔 입어야 할까?": False, "내일 비 와?": False}
+        for message, expected in cases.items():
+            with self.subTest(message), tod.Harness(llm=tod.FakeLLM(
+                    {message: tod.u(**tod.WQ, city_text="인천", date_text="내일")})) as h:
+                result = run_with_schedule(h, message, schedule_hint=SCHEDULE_HINT)
+                # 의도는 모델이 고른 그대로다. (지역이 발화에 없으면 기존 규칙대로 지역을 묻는 경로가 될 수 있다)
+                self.assertEqual(result["intent"], "weather_question")
+                self.assertNotEqual(result["decision"]["kind"], "schedule_handoff")
+                self.assertEqual("schedule_recheck_suggested" in result["llm"]["rules_applied"], expected)
+        message = "내일 시장 가는 시간 바꿔 줘, 비 와?"
+        with tod.Harness(llm=tod.FakeLLM({message: tod.u(**tod.WQ, city_text="인천", date_text="내일")})) as h:
+            old = h.run(message)
+            off = run_with_schedule(h, message, schedule_handoff=False)
+        for result in (old, off):
+            self.assertNotIn("schedule_recheck_suggested", result["llm"]["rules_applied"])
+        self.assertFalse(od.needs_schedule_recheck("schedule_change", "시간 바꿔 줘"))
+        self.assertFalse(od.needs_schedule_recheck("weather_question", None))
+
+    def test_OD09_multi_turn_intent_change_is_not_an_answer(self):
+        """OD09 다중 턴: 지역을 묻는 중 '아니 날씨 말고 내일 일정 바꿔 줘' → 대답으로 묶지 않고 일정 변경으로 넘긴다."""
+        first, second = tod.LATER_MEAL_Q, "아니 날씨 말고 내일 일정 바꿔 줘"
+        llm = tod.FakeLLM({first: tod.LATER_MEAL_U,
+                           second: tod.u(intent="schedule_change", answers_previous_question=True, date_text="내일")})
+        with tod.Harness(llm=llm, now=tod.NOV25_1500) as h:
+            asked = run_with_schedule(h, first, schedule_hint=SCHEDULE_HINT)
+            self.assertEqual(asked["route"], "needs_clarification")
+            moved = run_with_schedule(h, second, asked["conversation_state"], schedule_hint=SCHEDULE_HINT)
+        self.assertEqual((moved["route"], moved["decision"]["kind"]), ("schedule_change", "schedule_handoff"))
+        self.assertIn("not_an_answer_to_pending_question", moved["llm"]["rules_applied"])
+        self.assertIsNone(moved["conversation_state"]["pending_question"])
+        self.assertEqual(h.weather.calls, [])
+
+
+# %% L-OD. 실제 qwen2.5:3b 의도 분류 측정 (--live-ollama 지정 시에만)
+# 핵심 요약: 정해진 문장 20개를 정해진 횟수(3회)만큼 실행해 모델의 원래 의도와 최종 경로를 모두 기록한다. 결과를 고르지 않는다.
+# 모델이 기대와 다르게 분류해도 이 테스트는 실패로 처리하지 않고 표로 보고한다. (모델 성능과 프로그램 결함을 구분하기 위함)
+# 프로그램 계약(예외 없음, 경로 값, 승인 제안 없음)은 assert로 확인한다.
+LIVE_INTENT_CASES = [
+    ("내일 시장 가는 시간 좀 바꿔 줘", {"schedule_change"}),
+    ("내일 오후 2시에 인천 가는데 비 오면 시간 바꿀까?", {"schedule_change"}),
+    ("내일 일정 좀 바꿔 줘", {"schedule_change"}),
+    ("시간은 네가 알아서 정해 줘", {"schedule_change"}),
+    ("오후 네 시 말고 저녁 일곱 시로 해 줘", {"schedule_change"}),
+    ("내일 일정 바꾸지 마", {"schedule_change"}),
+    ("시간을 바꿀 필요는 없어", {"schedule_change"}),
+    ("비가 오면 시간을 바꿀까?", {"schedule_change"}),
+    ("아까 바꾼 일정 몇 시였지?", {"schedule_history", "schedule_query"}),
+    ("원래 시장에 몇 시에 가려고 했지?", {"schedule_history", "schedule_query"}),
+    ("내가 내일 뭐 하기로 했지?", {"schedule_query"}),
+    ("다음 약속이 뭐야?", {"schedule_query"}),
+    ("내일 아침 여덟 시에 산책할 거야. 기억해 줘.", {"schedule_create"}),
+    ("내일 장보기는 안 갈래", {"schedule_cancel"}),
+    ("오늘 시장 다녀왔어", {"schedule_complete"}),
+    ("내일 인천 비 와?", {"weather_question"}),
+    ("내일 시장 가는데 뭐 입고 가?", {"outing_consultation"}),
+    ("폭염 때는 어떻게 해야 돼?", {"safety_guidance"}),
+    ("우유하고 계란이 떨어졌어", {"living_support"}),
+    ("오늘 심심하다", {"daily_conversation"}),
+]
+LIVE_REPEATS = 3
+
+
+class L_OD_LiveIntent(unittest.TestCase):
+
+    def setUp(self):
+        if not OPTIONS.live_ollama:
+            raise unittest.SkipTest("--live-ollama 를 지정하면 실행합니다. (ollama serve와 qwen2.5:3b 필요)")
+        report = od.ollama_status(od.ollama_settings())
+        if not (report["server_running"] and report["model_installed"]):
+            raise unittest.SkipTest(f"Ollama 서버 또는 모델이 준비되지 않았습니다: {report}")
+
+    def test_L_OD01_intent_classification_table(self):
+        """L-OD01 실제 Qwen 의도 분류: 모델 원래 의도, 재확인 신호, 최종 경로를 모두 기록한다. (날씨·RAG는 넘김 경로에서 실행 안 함)"""
+        rows = []
+        for message, expected in LIVE_INTENT_CASES:
+            for attempt in range(1, LIVE_REPEATS + 1):
+                result = od.run_outing_decision_with_schedule(message, schedule_hint=SCHEDULE_HINT)
+                json.dumps(result, ensure_ascii=False, allow_nan=False)
+                self.assertIn(result["route"], od.ROUTES)
+                if result["route"] in od.SCHEDULE_INTENTS + ("schedule_change",):
+                    self.assertIsNone(result["proposed_action"])
+                understanding = result["llm"].get("understanding") or {}
+                raw = understanding.get("intent")
+                rows.append({"message": message, "attempt": attempt, "expected": sorted(expected), "model_intent": raw,
+                             "route": result["route"], "status": result["status"],
+                             "recheck": "schedule_recheck_suggested" in result["llm"]["rules_applied"],
+                             "model_ok": raw in expected, "route_ok": result["route"] in expected})
+        model_ok = sum(r["model_ok"] for r in rows)
+        route_ok = sum(r["route_ok"] for r in rows)
+        rechecked = [r for r in rows if r["recheck"]]
+        print(f"\n  [L-OD01] 실행 {len(rows)}회 | 모델 원래 의도 일치 {model_ok} | 최종 경로 일치 {route_ok} | 재확인 신호 {len(rechecked)}")
+        for r in rows:
+            mark = "O" if r["model_ok"] else "X"
+            print(f"  {mark} #{r['attempt']} {r['message'][:24]:<24} 기대={'/'.join(r['expected'])} 모델={r['model_intent']} "
+                  f"경로={r['route']} 상태={r['status']} 재확인={'예' if r['recheck'] else '-'}")
 
 
 # %% R층. 기존 파일 보존과 운영 저장소 격리 (요구 31·34)

@@ -37,7 +37,10 @@ import test_outing_decision as tod
 ROOT = Path(__file__).resolve().parent
 OPTIONS = SimpleNamespace(device=None, live_ollama=False)
 BASE_COMMIT = "c4e2ca0"
-PROTECTED_FILES = ("a_outing.py", "safety_rag.py", "outing_decision.py", "test_outing_decision.py")
+# (5단계 구현 단위 3에서 변경) outing_decision.py는 승인된 계획(일정 의도 5개·일정 넘김 경로 추가)에 따라 일부러 수정하므로
+# 해시 비교 대상에서 뺐다. 대신 3단계 회귀 테스트 전체(test_outing_decision.py, 이 파일은 계속 해시로 보호)와
+# test_schedule.py의 3단계 공개 계약 테스트(시그니처·반환 키·기존 의도·이해 스키마 유지)가 기존 동작을 검증한다.
+PROTECTED_FILES = ("a_outing.py", "safety_rag.py", "test_outing_decision.py")
 
 
 # %% 가상 A 결과 (run_outing_decision 반환 계약의 필요한 부분)
@@ -979,7 +982,7 @@ class L_LiveIntegration(GraphCase):
 class R_Regression(unittest.TestCase):
 
     def test_R1_protected_files_match_base_commit(self):
-        """R1 1·2·3단계 파일의 SHA-256이 기준 커밋과 같다. (줄바꿈 CRLF/LF 차이는 같게 본다)"""
+        """R1 1·2단계 운영 파일과 3단계 테스트 파일의 SHA-256이 기준 커밋과 같다. (줄바꿈 CRLF/LF 차이는 같게 본다)"""
         for name in PROTECTED_FILES:
             with self.subTest(name):
                 try:
