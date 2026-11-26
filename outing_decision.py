@@ -3018,7 +3018,8 @@ def main(argv=None):
     """대화형 모드에서는 대화 상태를 메모리에만 두고, 파일로 저장하지 않는다."""
     parser = argparse.ArgumentParser(description="SafeMate 3단계 대화형 외출·날씨 도우미")
     parser.add_argument("message", nargs="?", help="질문 한 문장. 생략하면 여러 턴 대화를 시작한다.")
-    parser.add_argument("--device", choices=["xpu", "cuda", "cpu"], help="MiniLM 임베딩 장치(공식 문서 검색용)")
+    parser.add_argument("--device", choices=["auto", "xpu", "cuda", "cpu"],
+                        help="MiniLM 임베딩 장치(공식 문서 검색용). auto는 CUDA → XPU → CPU 순서로 실제 확인해 고른다")
     parser.add_argument("--json", action="store_true", help="전체 결과를 JSON으로 출력")
     parser.add_argument("--debug", action="store_true", help="답변과 함께 경로·도구 기록 요약 출력")
     parser.add_argument("--check", action="store_true", help="Ollama와 임베딩 장치 상태만 확인")
@@ -3035,12 +3036,23 @@ def main(argv=None):
     if callable(reconfigure):
         reconfigure(errors="replace")
 
-    # 2. 환경 확인만 요청한 경우
+    # 2. (5-5단계) --device auto: 시작할 때 한 번만 장치를 실제로 확인해 고른다. 쓸 장치가 없으면 이유를 보여 주고 실패로 끝낸다.
+    # (환경변수를 바꾸지 않는다. 고른 장치 이름을 아래 공개 함수에 그대로 넘긴다)
     device, as_json, debug = args.pop("device"), args.pop("json"), args.pop("debug")
+    if device == "auto":
+        from device_utils import select_embedding_device
+        selection = select_embedding_device("auto")
+        if not selection["ok"]:
+            print(json.dumps({"embedding_device": selection}, ensure_ascii=False, indent=2, default=str))
+            return 1
+        device = selection["selected"]
+        print(f"[장치] auto → {device} ({selection['device']}, {selection['details']['dimensions']}차원 확인)", file=sys.stderr)
+
+    # 3. 환경 확인만 요청한 경우
     if args.pop("check"):
         return environment_check(device)
 
-    # 3. 구조화 인자를 기존 3단계와 같은 요청 딕셔너리로 바꾼다.
+    # 4. 구조화 인자를 기존 3단계와 같은 요청 딕셔너리로 바꾼다.
     message, conditions = args.pop("message"), args.pop("condition")
     values = {k: v for k, v in args.items() if v is not None}
     if "can_reschedule" in values:
@@ -3048,14 +3060,14 @@ def main(argv=None):
     if conditions:
         values["user_reported_conditions"] = conditions
 
-    # 4. 문장이나 구조화 값이 있으면 한 번만 처리한다.
+    # 5. 문장이나 구조화 값이 있으면 한 번만 처리한다.
     if message or values:
         values["user_message"] = message or ""
         result = run_outing_decision(values, device=device)
         print_result(result, as_json=as_json, debug=debug)
         return 0 if result["status"] in ("ok", "needs_input") else 1
 
-    # 5. 여러 턴 대화: 같은 conversation_state를 다음 턴에 넘긴다. '그만'이나 빈 줄로 끝낸다.
+    # 6. 여러 턴 대화: 같은 conversation_state를 다음 턴에 넘긴다. '그만'이나 빈 줄로 끝낸다.
     print("SafeMate 대화를 시작합니다. 끝내려면 '그만' 또는 빈 줄을 입력하세요.")
     state = None
     while True:

@@ -18,10 +18,12 @@
 
 # %% 공통 라이브러리와 검사 대상 불러오기
 # 핵심 요약: 테스트 대상 모듈과 표준 라이브러리만 쓴다. 테스트 시작 시점의 운영 저장소 상태를 기록해 두었다가 끝에 비교한다.
+import contextlib
 import copy
 import hashlib
 import importlib.util
 import inspect
+import io
 import json
 import os
 import re
@@ -37,9 +39,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
+from urllib.parse import urlsplit
 
+import device_utils as du
 import outing_decision as od
 import safemate_graph as sg
+import safety_rag as sr
 import schedule_agent as sa
 import schedule_service as sv
 import schedule_store as ss
@@ -3024,6 +3029,653 @@ class L_AG_LiveFlow(unittest.TestCase):
         # 프로그램 계약: 예외 없이 끝나고, 어떤 경우에도 잘못된 저장이 없어야 한다. (모델 판단 실패는 표로만 보고)
         self.assertTrue(all(r["graph_ok"] for r in rows), [r["notes"] for r in rows])
         self.assertTrue(all(r["safe_ok"] for r in rows))
+
+
+# %% 5-5단계 장치 선택 테스트 도우미 (가짜 torch·가짜 MiniLM 로딩)
+# 핵심 요약: 실제 장치 없이 CUDA·XPU·CPU의 백엔드 유무·is_available·텐서 연산·모델 로딩·검증 결과를 바꿔 가며 선택 규칙을 확인한다.
+# 2단계 configure_embedding_device()는 함수 안에서 'import torch'를 하므로 sys.modules의 가짜 torch를 그대로 쓴다. (실제 코드 실행)
+class FakeDevice:
+    """torch.device 흉내: 종류·번호가 같으면 같은 장치"""
+
+    def __init__(self, kind: str, index: int | None = None):
+        self.type, self.index = kind, index
+
+    def __eq__(self, other: object) -> bool:
+        return isinstance(other, FakeDevice) and (self.type, self.index) == (other.type, other.index)
+
+    def __hash__(self) -> int:
+        return hash((self.type, self.index))
+
+    def __str__(self) -> str:
+        return self.type if self.index is None else f"{self.type}:{self.index}"
+
+
+class FakeTensor:
+    def __init__(self, device: FakeDevice, value: int):
+        self.device, self.value = device, value
+
+    def sum(self) -> "FakeTensor":
+        return FakeTensor(self.device, self.value)
+
+    def item(self) -> int:
+        return self.value
+
+
+class FakeBackend:
+    """torch.cuda·torch.xpu 흉내. available이 예외면 is_available()에서 그 예외를 낸다."""
+
+    def __init__(self, available: Any = True, tensor_ok: bool = True, empty_error: bool = False):
+        self.available, self.tensor_ok, self.empty_error, self.emptied = available, tensor_ok, empty_error, 0
+
+    def is_available(self) -> Any:
+        if isinstance(self.available, Exception):
+            raise self.available
+        return self.available
+
+    def current_device(self) -> int:
+        return 0
+
+    def empty_cache(self) -> None:
+        self.emptied += 1
+        if self.empty_error:
+            raise RuntimeError("가짜 empty_cache 오류")
+
+
+def fake_torch(cuda: FakeBackend | None = None, xpu: FakeBackend | None = None, *, cpu_ok: bool = True,
+               version: dict[str, Any] | None = None) -> SimpleNamespace:
+    """backends에 없는 장치는 속성 자체가 없다. version=None이면 torch.version 속성도 없다."""
+    torch = SimpleNamespace(__version__="0.0-fake")
+    if version is not None:
+        torch.version = SimpleNamespace(**version)
+    backends = {"cuda": cuda, "xpu": xpu}
+    for name, backend in backends.items():
+        if backend is not None:
+            setattr(torch, name, backend)
+
+    def ones(count: int, device: FakeDevice) -> FakeTensor:
+        ok = cpu_ok if device.type == "cpu" else getattr(backends[device.type], "tensor_ok", False)
+        if not ok:
+            raise RuntimeError(f"가짜 {device.type} 커널 오류")
+        return FakeTensor(device, count)
+
+    torch.device = lambda kind, index=None: FakeDevice(kind, index)
+    torch.ones = ones
+    return torch
+
+
+def fake_details(device: str, **over: Any) -> dict[str, Any]:
+    actual = "cpu" if device == "cpu" else f"{device}:0"
+    return dict({"requested": device, "weights": actual, "token_input": actual, "token_output": actual,
+                 "embedding": actual, "dimensions": 384, "gpu_name": None, "torch": "0.0-fake"}, **over)
+
+
+class FakeLoader:
+    """load_embeddings 흉내. modes: {장치: ok | load_fail | verify_fail | bad_dims}"""
+
+    def __init__(self, **modes: str):
+        self.modes, self.calls = modes, []
+
+    def __call__(self, device: str):
+        self.calls.append(device)
+        mode = self.modes.get(device, "ok")
+        if mode == "load_fail":
+            raise sr.SafetyError("model_error", f"{device} 모델 로딩·추론 실패.") from RuntimeError("가짜 다운로드 실패")
+        if mode == "verify_fail":
+            raise sr.SafetyError("model_error", f"{device} 모델 로딩·추론 실패.") from ValueError(
+                f"임베딩 장치·차원 불일치. 선택 {device}:0, 출력 cpu")
+        return object(), fake_details(device, dimensions=512) if mode == "bad_dims" else fake_details(device)
+
+
+def patched_devices(torch: Any, loader: FakeLoader | None = None):
+    """가짜 torch와 가짜 MiniLM 로딩을 끼운다. (2단계 configure_embedding_device는 실제 코드 그대로 실행)"""
+    stack = contextlib.ExitStack()
+    stack.enter_context(mock.patch.dict(sys.modules, {"torch": torch}))
+    stack.enter_context(mock.patch.object(sr, "load_embeddings", loader or FakeLoader()))
+    return stack
+
+
+def stages(selection: dict[str, Any]) -> list[tuple[str, str, bool]]:
+    return [(a["device"], a["stage"], a["ok"]) for a in selection["attempts"]]
+
+
+# %% M-DV1. 임베딩 장치 자동 선택·직접 지정 (요구사항 7.1·7.2·7.3, 승인 계획 11절)
+class M_DV1_Selection(unittest.TestCase):
+
+    def test_DV01_auto_prefers_cuda(self):
+        """DV01 CUDA가 모든 검사를 통과하면 CUDA를 고르고, XPU·CPU는 검사하지 않는다."""
+        with patched_devices(fake_torch(FakeBackend(), FakeBackend(), version={"cuda": "12.4"})):
+            selection = du.select_embedding_device("auto")
+        self.assertEqual((selection["ok"], selection["selected"], selection["device"], selection["mode"]),
+                         (True, "cuda", "cuda:0", "auto"))
+        self.assertEqual({a["device"] for a in selection["attempts"]}, {"cuda"})
+        self.assertEqual(selection["details"]["dimensions"], 384)
+        self.assertEqual(selection["attempts"][0]["build"], "12.4")
+
+    def test_DV02_cuda_unavailable_then_xpu_then_cpu(self):
+        """DV02 CUDA 불가 → XPU, CUDA·XPU 불가 → CPU. 시도 순서와 전환 이유를 기록한다."""
+        with patched_devices(fake_torch(FakeBackend(available=False), FakeBackend())):
+            xpu = du.select_embedding_device("auto")
+        self.assertEqual(xpu["selected"], "xpu")
+        self.assertEqual(stages(xpu)[:2], [("cuda", "backend", True), ("cuda", "is_available", False)])
+        self.assertEqual(xpu["switch_reasons"], ["cuda: is_available() 실패 → 다음 장치"])
+        with patched_devices(fake_torch(FakeBackend(available=False), FakeBackend(available=False))):
+            cpu = du.select_embedding_device("auto")
+        self.assertEqual((cpu["selected"], cpu["device"]), ("cpu", "cpu"))
+        self.assertEqual([d for d, _, _ in stages(cpu)], ["cuda", "cuda", "xpu", "xpu"] + ["cpu"] * 4)
+
+    def test_DV03_available_but_tensor_fails(self):
+        """DV03 is_available()은 True인데 실제 텐서 연산이 실패하면 그 장치를 쓰지 않고 다음 장치로 넘어간다. (GPU 인식 ≠ GPU 연산)"""
+        with patched_devices(fake_torch(FakeBackend(tensor_ok=False), FakeBackend())):
+            selection = du.select_embedding_device("auto")
+        self.assertEqual(selection["selected"], "xpu")
+        self.assertIn(("cuda", "tensor", False), stages(selection))
+        self.assertIn("가짜 cuda 커널 오류", next(a for a in selection["attempts"] if a["stage"] == "tensor")["reason"])
+
+    def test_DV04_model_failures_are_not_guessed(self):
+        """DV04 텐서 연산 뒤 MiniLM 실패: 장치·차원 불일치는 embedding_verify, 나눌 수 없는 오류는 원래 예외와 판단 한계를 남긴다.
+        돌려받은 검증 정보의 차원이 384가 아니면 report_check에서 막는다."""
+        cases = {"load_fail": ("model", "가짜 다운로드 실패"), "verify_fail": ("embedding_verify", "임베딩 장치·차원 불일치"),
+                 "bad_dims": ("report_check", "dimensions=512")}
+        for mode, (stage, text) in cases.items():
+            with self.subTest(mode), patched_devices(fake_torch(FakeBackend(), None), FakeLoader(cuda=mode)):
+                selection = du.select_embedding_device("auto")
+                failed = next(a for a in selection["attempts"] if a["device"] == "cuda" and not a["ok"])
+                self.assertEqual(failed["stage"], stage)
+                self.assertIn(text, failed.get("cause") or failed["reason"])
+                if mode == "load_fail":
+                    self.assertEqual(failed["note"], du.AMBIGUOUS_MODEL_NOTE)
+                self.assertEqual(selection["selected"], "cpu")       # XPU 백엔드가 없으므로 CPU
+
+    def test_DV05_missing_backend_and_build_info(self):
+        """DV05 XPU 백엔드가 없으면 backend 단계에서 실패한다. torch.version 속성이 없어도 실제 연산이 되는 장치는 빼지 않는다."""
+        with patched_devices(fake_torch(FakeBackend(available=False), None, version=None)):
+            selection = du.select_embedding_device("auto")
+        self.assertIn(("xpu", "backend", False), stages(selection))
+        self.assertEqual(selection["selected"], "cpu")
+        with patched_devices(fake_torch(FakeBackend(), None, version=None)):
+            cuda = du.select_embedding_device("cuda")
+        self.assertEqual((cuda["selected"], cuda["attempts"][0]["build"]), ("cuda", None))
+
+    def test_DV06_manual_failure_never_switches(self):
+        """DV06 cuda·xpu를 직접 지정해 실패하면 다른 장치를 시도하지 않고 실패로 돌려준다."""
+        for device in ("cuda", "xpu"):
+            with self.subTest(device), patched_devices(fake_torch(FakeBackend(available=False), FakeBackend(available=False))):
+                selection = du.select_embedding_device(device)
+                self.assertEqual((selection["ok"], selection["selected"], selection["mode"]), (False, None, "manual"))
+                self.assertEqual({a["device"] for a in selection["attempts"]}, {device})
+                self.assertIn("다른 장치로 바꾸지 않았습니다", selection["error"])
+
+    def test_DV07_no_device_and_no_torch(self):
+        """DV07 CPU까지 실패하면 실행 가능 장치가 없다고 알리고 성공으로 처리하지 않는다. PyTorch가 없으면 import_torch 단계 실패다."""
+        with patched_devices(fake_torch(None, None, cpu_ok=False)):
+            selection = du.select_embedding_device("auto")
+        self.assertEqual((selection["ok"], selection["selected"]), (False, None))
+        self.assertIn("실행 가능한 임베딩 장치가 없습니다", selection["error"])
+        with mock.patch.object(du, "_import_torch", side_effect=ImportError("No module named 'torch'")):
+            missing = du.select_embedding_device("auto")
+        self.assertEqual((missing["ok"], stages(missing)), (False, [("cuda", "import_torch", False)]))
+
+    def test_DV08_invalid_requests(self):
+        """DV08 auto·cuda·xpu·cpu가 아닌 값은 검사하지 않고 invalid로 돌려준다."""
+        values: list[Any] = ["gpu", "CUDA", "", None, ["xpu"]]     # 문자열이 아닌 값도 예외 없이 invalid여야 한다
+        for value in values:
+            with self.subTest(value=value):
+                selection = du.select_embedding_device(value)
+                self.assertEqual((selection["mode"], selection["ok"], selection["attempts"]), ("invalid", False, []))
+
+    def test_DV09_cleanup_only_failed_device(self):
+        """DV09 실패한 장치의 쓰지 않는 캐시만 정리한다. 선택한 장치는 정리하지 않고, 정리 오류가 원래 실패 이유를 덮지 않는다."""
+        cuda, xpu = FakeBackend(tensor_ok=False, empty_error=True), FakeBackend()
+        with patched_devices(fake_torch(cuda, xpu)):
+            selection = du.select_embedding_device("auto")
+        self.assertEqual((cuda.emptied, xpu.emptied), (1, 0))
+        failed = next(a for a in selection["attempts"] if a["device"] == "cuda" and not a["ok"])
+        self.assertIn("가짜 cuda 커널 오류", failed["reason"])
+        self.assertIn("가짜 empty_cache 오류", failed["cleanup_error"])
+
+    def test_DV10_torch_only_selection_for_b(self):
+        """DV10 B기능용 선택은 텐서 연산까지만 확인하고 A의 MiniLM을 불러오지 않는다."""
+        loader = FakeLoader()
+        with patched_devices(fake_torch(FakeBackend(available=False), FakeBackend()), loader):
+            selection = du.select_torch_device("auto")
+        self.assertEqual((selection["selected"], selection["check"]), ("xpu", "torch_only"))
+        self.assertEqual(loader.calls, [])
+        self.assertIn("B 코드 연결 후", selection["details"]["model_check"])
+
+
+# %% M-DV2. Ollama 실행 장치 보고 (요구사항 7.4: PyTorch 장치와 분리, 모델 미적재를 CPU로 보지 않음)
+PS_MODEL = "qwen2.5:3b"
+
+
+def ps_entry(name: str = PS_MODEL, **values: Any) -> dict[str, Any]:
+    return {"name": name, "model": name, **values}
+
+
+class M_DV2_Ollama(unittest.TestCase):
+
+    def test_DV11_classify_ps_states(self):
+        """DV11 대상 모델 항목만 판정하고, 연결 실패·응답 오류·미적재·값 누락·잘못된 값·0·부분·전체를 구분한다."""
+        cases = [
+            ((None, None, "ConnectionRefusedError"), "server_unreachable"),
+            ((500, {"error": "x"}, None), "response_error"),
+            ((200, {"items": []}, None), "response_error"),
+            ((200, {"models": []}, None), "not_loaded"),
+            ((200, {"models": [ps_entry("llama3:8b", size=100, size_vram=100)]}, None), "not_loaded"),
+            ((200, {"models": [ps_entry(size=100, size_vram=0)]}, None), "no_gpu_memory"),
+            ((200, {"models": [ps_entry(size=100, size_vram=100)]}, None), "gpu_memory_full"),
+            ((200, {"models": [ps_entry(size=100, size_vram=40)]}, None), "gpu_memory_partial"),
+            ((200, {"models": [ps_entry(size=100)]}, None), "invalid_values"),
+            ((200, {"models": [ps_entry(size=True, size_vram=0)]}, None), "invalid_values"),
+            ((200, {"models": [ps_entry(size=100, size_vram=-1)]}, None), "invalid_values"),
+            ((200, {"models": [ps_entry(size="100", size_vram=10)]}, None), "invalid_values"),
+            ((200, {"models": [ps_entry(size=100, size_vram=150)]}, None), "invalid_values"),
+            ((200, {"models": [ps_entry(size=0, size_vram=0)]}, None), "invalid_values"),
+            ((200, {"models": [ps_entry(size=100, size_vram=100), ps_entry(size=100, size_vram=0)]}, None), "invalid_values"),
+        ]
+        for (status, data, error), state in cases:
+            with self.subTest(state=state, data=data):
+                result = du.classify_ps(status, data, error, PS_MODEL)
+                self.assertEqual(result["state"], state)
+                if state == "not_loaded":
+                    self.assertIn("CPU 실행이라는 뜻이 아님", result["message"])
+                if state == "gpu_memory_full":
+                    self.assertIn("모든 연산이 GPU에서 됐다는 보장은 아님", result["message"])
+                    self.assertIn("GPU 종류·추론 백엔드는 확인하지 않음", result["message"])
+                if state == "no_gpu_memory":
+                    self.assertIn("GPU 메모리 사용이 보고되지 않았습니다", result["message"])
+
+    def ollama(self, status: dict[str, Any], ps: list[tuple[Any, Any, Any]], probe_error: Exception | None = None):
+        stack = contextlib.ExitStack()
+        stack.enter_context(mock.patch.dict(os.environ, tod.clean_env(), clear=True))
+        stack.enter_context(mock.patch.object(od, "ollama_status", lambda settings: status))
+        stack.enter_context(mock.patch.object(du, "_get_json", side_effect=ps))
+        calls: list[str] = []
+
+        def fake_call(messages, schema, settings, *, stage, max_tokens=None, temperature=None):
+            calls.append(stage)
+            if probe_error:
+                raise probe_error
+            return '{"ok": true}', {"stage": stage, "model": settings["model"], "total_duration_ms": 7}
+
+        stack.enter_context(mock.patch.object(od, "call_ollama", fake_call))
+        stack.enter_context(mock.patch.object(du, "ollama_cli", lambda settings, model: {"status": "skipped"}))
+        return stack, calls
+
+    def test_DV12_report_before_and_after_probe(self):
+        """DV12 호출 전(미적재)과 짧은 실제 호출 직후(적재) 측정을 따로 남긴다. 호출 실패도 숨기지 않는다. 서버 연결 실패는 따로 알린다."""
+        up = {"server_running": True, "model_installed": True}
+        stack, calls = self.ollama(up, [(200, {"models": []}, None), (200, {"models": [ps_entry(size=10, size_vram=10)]}, None)])
+        with stack:
+            report = du.ollama_report(probe=True)
+        self.assertEqual((report["before"]["state"], report["after"]["state"]), ("not_loaded", "gpu_memory_full"))
+        self.assertEqual((report["before"]["measured_at"], report["after"]["measured_at"]), ("호출 전", "호출 직후"))
+        self.assertEqual((report["probe"]["status"], calls), ("ok", ["device_probe"]))
+        stack, _ = self.ollama(up, [(200, {"models": []}, None)] * 2,
+                               probe_error=od.DecisionError("llm_unavailable", "inference_timeout", "시간 초과"))
+        with stack:
+            failed = du.ollama_report(probe=True)
+        self.assertEqual((failed["probe"]["status"], failed["after"]["state"]), ("llm_unavailable", "not_loaded"))
+        stack, calls = self.ollama({"server_running": False, "model_installed": False, "error": "ConnectionRefusedError"},
+                                   [(None, None, "ConnectionRefusedError")])
+        with stack:
+            down = du.ollama_report(probe=True)
+        self.assertEqual((down["before"]["state"], down["probe"], calls), ("server_unreachable", None, []))
+
+    def test_DV13_cli_only_for_same_server(self):
+        """DV13 ollama ps 명령은 SafeMate가 쓰는 서버와 같은 서버를 볼 때만 참고 정보로 쓴다."""
+        settings = {"server": urlsplit("http://127.0.0.1:11434"), "port": 11434}
+        for env, same in (({}, True), ({"OLLAMA_HOST": "127.0.0.1:11434"}, True), ({"OLLAMA_HOST": "10.0.0.5:11434"}, False),
+                          ({"OLLAMA_HOST": "http://localhost:11500"}, False)):
+            with self.subTest(env=env), mock.patch.dict(os.environ, env, clear=True):
+                self.assertEqual(du._same_server(settings), same)
+        remote = {"server": urlsplit("http://10.0.0.5:11434"), "port": 11434}
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(du.shutil, "which", return_value="ollama"):
+            self.assertEqual(du.ollama_cli(remote, PS_MODEL)["status"], "skipped")
+
+    def test_DV14_diagnostic_exit_codes(self):
+        """DV14 진단 명령: 직접 지정 실패·전체 실패·잘못된 장치는 1, 임베딩 성공·Ollama 문제는 2, 모두 정상은 0이다."""
+        ok = {"ok": True, "selected": "cpu", "device": "cpu", "mode": "manual", "requested": "cpu", "attempts": [],
+              "details": fake_details("cpu"), "switch_reasons": [], "error": None, "cached_models": 1}
+        bad = dict(ok, ok=False, selected=None, device=None, details=None, error="실패")
+        up = {"server": "s", "model": PS_MODEL, "server_running": True, "model_installed": True,
+              "before": {"state": "not_loaded", "message": "", "measured_at": "호출 전"}, "after": None, "probe": None, "cli": None}
+        for selection, ollama, code in ((bad, up, 1), (ok, dict(up, server_running=False), 2), (ok, up, 0)):
+            with self.subTest(code=code), mock.patch.object(du, "select_embedding_device", return_value=selection), \
+                    mock.patch.object(du, "ollama_report", return_value=ollama), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(du.main(["--device", "cpu"]), code)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(du.main(["--device", "gpu", "--no-ollama"]), 1)
+
+    def test_DV34_malformed_model_info_is_not_measured(self):
+        """DV34 (외부 검토) 모델 이름이 리스트·식별 정보 없음·name과 model이 서로 다름·항목이 딕셔너리가 아님·models=null은
+        예외 없이 비정상 응답으로 판정한다. 정상 미적재나 측정값으로 보지 않는다. ':latest'만 다른 같은 이름은 같은 모델이다."""
+        cases = [({"models": [{"name": [], "size": 100, "size_vram": 0}]}, "invalid_model_info"),
+                 ({"models": [{}]}, "invalid_model_info"),
+                 ({"models": [{"name": "", "size": 100, "size_vram": 0}]}, "invalid_model_info"),
+                 ({"models": [ps_entry(size=100, size_vram=100) | {"model": "llama3:8b"}]}, "invalid_model_info"),
+                 ({"models": ["qwen2.5:3b"]}, "invalid_model_info"),
+                 ({"models": None}, "response_error"),
+                 ([], "response_error")]
+        for data, state in cases:
+            with self.subTest(data=data):
+                self.assertEqual(du.classify_ps(200, data, None, PS_MODEL)["state"], state)
+        latest = {"models": [{"name": "qwen2.5:3b:latest", "model": "qwen2.5:3b", "size": 100, "size_vram": 0}]}
+        self.assertEqual(du.classify_ps(200, latest, None, PS_MODEL)["state"], "no_gpu_memory")
+
+    def test_DV35_status_parse_error_is_response_error(self):
+        """DV35 (외부 검토) 3단계 ollama_status()가 []·null 응답으로 예외를 내도 진단은 멈추지 않고 '응답 형식 오류'로 보고한다.
+        서버 실행·모델 설치를 확인하지 못한 것으로 두고, 미설치·CPU 실행으로 판정하지 않는다."""
+        for error in (AttributeError("'list' object has no attribute 'get'"), TypeError("'NoneType' object is not iterable")):
+            with self.subTest(error=type(error).__name__), mock.patch.dict(os.environ, tod.clean_env(), clear=True), \
+                    mock.patch.object(od, "ollama_status", side_effect=error):
+                report = du.ollama_report(probe=True)
+                self.assertEqual((report["before"]["state"], report["server_running"], report["model_installed"]),
+                                 ("response_error", None, None))
+                self.assertEqual((report["probe"], report["verdict"]["ok"]), (None, False))
+
+    def test_DV36_verdict_and_exit_codes_for_measurement(self):
+        """DV36 (외부 검토) 종료 코드 2: /api/ps 응답 오류·잘못된 측정값·호출 실패·호출 직후 미적재(장치 확인 불가).
+        종료 코드 0: 호출을 요청하지 않은 정상 미적재, 호출 직후 CPU 추론(GPU 메모리 0), --no-ollama."""
+        def report(before, probe=None, after=None):
+            return {"server": "s", "model": PS_MODEL, "server_running": True, "model_installed": True, "cli": None,
+                    "before": {"state": before, "message": "", "measured_at": "호출 전"}, "probe": probe,
+                    "after": {"state": after, "message": "", "measured_at": "호출 직후"} if after else None}
+        ok_probe = {"status": "ok"}
+        cases = [(report("response_error"), False, 2), (report("invalid_values"), False, 2),
+                 (report("invalid_model_info"), False, 2), (report("not_loaded"), False, 0),
+                 (report("gpu_memory_full"), False, 0),
+                 (report("not_loaded", {"status": "llm_unavailable"}, "not_loaded"), True, 2),
+                 (report("not_loaded", ok_probe, "not_loaded"), True, 2),
+                 (report("not_loaded", ok_probe, "response_error"), True, 2),
+                 (report("not_loaded", ok_probe, "no_gpu_memory"), True, 0),
+                 (report("not_loaded", ok_probe, "gpu_memory_partial"), True, 0)]
+        selection = selection_of("cpu", requested="cpu", mode="manual")
+        for ollama, probe, code in cases:
+            with self.subTest(before=ollama["before"]["state"], after=(ollama["after"] or {}).get("state"), probe=probe), \
+                    mock.patch.object(du, "select_embedding_device", return_value=selection), \
+                    mock.patch.object(du, "ollama_report", return_value=ollama), contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(du.main(["--device", "cpu"] + (["--ollama-probe"] if probe else [])), code)
+                self.assertEqual(du.ollama_verdict(ollama, probe)["ok"], code == 0)
+        with mock.patch.object(du, "select_embedding_device", return_value=selection), \
+                mock.patch.object(du, "ollama_report") as never, contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(du.main(["--device", "cpu", "--no-ollama"]), 0)
+        never.assert_not_called()
+
+    def test_DV37_cli_same_server_scheme_path_and_exit_code(self):
+        """DV37 (외부 검토) https·경로가 붙은 주소, 스킴·경로가 다른 OLLAMA_HOST는 같은 서버로 보지 않는다.
+        ollama ps 종료 코드가 0이 아니면 출력이 있어도 성공으로 처리하지 않는다."""
+        for url, env in (("https://localhost:11434", {}), ("http://localhost:11434/proxy", {}),
+                         ("http://127.0.0.1:11434", {"OLLAMA_HOST": "https://127.0.0.1:11434"}),
+                         ("http://127.0.0.1:11434", {"OLLAMA_HOST": "127.0.0.1:11434/proxy"})):
+            with self.subTest(url=url, env=env), mock.patch.dict(os.environ, env, clear=True):
+                self.assertFalse(du._same_server({"server": urlsplit(url), "port": 11434}))
+        with mock.patch.dict(os.environ, {"OLLAMA_HOST": "http://localhost:11434"}, clear=True):
+            self.assertTrue(du._same_server({"server": urlsplit("http://127.0.0.1:11434"), "port": 11434}))
+        settings = {"server": urlsplit("http://127.0.0.1:11434"), "port": 11434}
+        table = "NAME          ID    SIZE    PROCESSOR    CONTEXT    UNTIL\nqwen2.5:3b    x     2 GB    100% CPU     4096       now\n"
+        for code, status in ((1, "error"), (0, "ok")):
+            with self.subTest(code=code), mock.patch.dict(os.environ, {}, clear=True), \
+                    mock.patch.object(du.shutil, "which", return_value="ollama"), \
+                    mock.patch.object(du.subprocess, "run", return_value=SimpleNamespace(returncode=code, stdout=table)):
+                result = du.ollama_cli(settings, PS_MODEL)
+                self.assertEqual(result["status"], status)
+                if status == "ok":
+                    self.assertEqual(result["processor"], "100% CPU")
+
+
+# %% I-DV3. 실제 그래프 실행 경로 연결 (보완 6: 진단 명령만이 아니라 build_graph에 연결)
+def selection_of(kind: str, **over: Any) -> dict[str, Any]:
+    """가짜 선택 결과 (kind: 고른 장치 이름)"""
+    actual = "cpu" if kind == "cpu" else f"{kind}:0"
+    return dict({"requested": "auto", "mode": "auto", "check": "minilm", "ok": True, "selected": kind, "device": actual,
+                 "attempts": [], "details": fake_details(kind), "switch_reasons": [], "error": None, "torch": "0.0-fake",
+                 "cached_models": 1}, **over)
+
+
+class RecordingA(FakeA):
+    """받은 장치·색인을 기록하는 A 함수"""
+
+    def __call__(self, request, *, device=None, index=None, conversation_state=None):
+        self.calls.append({"request": request, "device": device, "index": index})
+        return copy.deepcopy(self.results[0])
+
+
+class I_DV3_GraphDevices(AgentCase):
+
+    def a_answer(self, route="weather_question", **over):
+        return dict(outing_result("2026-11-26T14:00:00+09:00", "2026-11-26T17:00:00+09:00"), route=route,
+                    requires_user_confirmation=False, proposed_action=None, answer="날씨 답변", **over)
+
+    def test_DV15_auto_selected_once_and_passed_to_a_and_schedule(self):
+        """DV15 build_graph(a_device="auto"): 그래프를 만들 때 한 번만 고르고, 고른 장치를 A 외출 판단과 일정 에이전트에 그대로 넘긴다."""
+        self.use()
+        fake_a = RecordingA(self.a_answer(route="schedule_query", llm={"understanding": {"intent": "schedule_query"},
+                                                                         "rules_applied": []}))
+        seen: list[Any] = []
+
+        def schedule_runner(request, *, store, conversation_state=None, device=None, index=None, now=None, context=None):
+            seen.append((device, index))
+            return {**sa.empty_schedule_result(), "status": "ok", "route": "schedule", "answer": "일정 답변",
+                    "conversation_state": sa.new_schedule_state(), "decision": {"kind": "schedule_answer"}}
+
+        with mock.patch.object(du, "select_embedding_device", return_value=selection_of("xpu")) as select:
+            graph = self.graph(a_runner=fake_a, a_device="auto", a_index=None, schedule_runner=schedule_runner)
+            for text in ("내일 일정 알려 줘", "모레 일정 알려 줘", "다음 일정 알려 줘"):
+                self.say(graph, text)
+        self.assertEqual(select.call_count, 1)
+        self.assertEqual({c["device"] for c in fake_a.calls}, {"xpu"})
+        self.assertEqual(seen, [("xpu", None)] * 3)
+        report = sg.runtime_report(graph)
+        self.assertEqual((report["a"]["selection"]["selected"], report["a"]["index_check"]["status"]), ("xpu", "lazy"))
+        self.assertTrue(report["schedule_store"])
+
+    def test_DV16_explicit_and_none_keep_old_behavior(self):
+        """DV16 a_device="xpu"·None은 기존과 같고 자동 선택을 실행하지 않는다. 저장소 미연결 그래프는 노드 6개 그대로다."""
+        self.use()
+        with mock.patch.object(du, "select_embedding_device") as select:
+            for device in ("xpu", "cpu", None):
+                fake_a = RecordingA(self.a_answer())
+                graph = sg.build_graph(a_runner=fake_a, a_device=device)
+                sg.send_message(graph, sg.new_thread_id(), "날씨 어때?")
+                self.assertEqual(fake_a.calls[0]["device"], device)
+                self.assertEqual(sg.runtime_report(graph)["a"], {"requested": device, "selection": None, "index_check": None})
+            with mock.patch.object(du, "select_embedding_device", return_value=selection_of("cpu")):
+                auto_graph = sg.build_graph(a_device="auto")
+        select.assert_not_called()
+        self.assertEqual(set(auto_graph.get_graph().nodes) - {"__start__", "__end__"},
+                         {"intake", "a_node", "b_node", "approval", "execute", "close"})
+
+    def test_DV17_no_device_stops_graph_creation(self):
+        """DV17 자동 선택이 모두 실패하면 그래프를 만들지 않고 DeviceSelectionError(시도 기록 포함)를 낸다."""
+        failed = selection_of("cpu", ok=False, selected=None, device=None, details=None,
+                              attempts=[{"device": "cpu", "stage": "model", "ok": False, "reason": "가짜"}],
+                              error="실행 가능한 임베딩 장치가 없습니다.")
+        with mock.patch.object(du, "select_embedding_device", return_value=failed):
+            with self.assertRaises(sg.DeviceSelectionError) as caught:
+                sg.build_graph(a_device="auto")
+        self.assertEqual(caught.exception.selection["attempts"][0]["stage"], "model")
+
+    def test_DV18_index_device_must_match_exactly(self):
+        """DV18 (외부 검토로 강화) 자동 선택 장치와 주입한 색인의 실제 장치가 번호까지 같을 때만 그래프를 만든다.
+        cuda:0/cuda:1·xpu:0/xpu:1·CPU/GPU 불일치와 장치 정보 누락은 IndexDeviceError로 막는다. 색인은 지우거나 바꾸지 않는다.
+        (변경 이유: 3단계 collect_evidence는 장치 종류만 비교해 cuda:1 색인으로도 실제 검색을 실행했다. 이전 DV18은 '불일치 안내 후
+        실행 중 검색 실패'를 기대했지만, 같은 종류·다른 번호에서는 검색이 실행되는 결함이 재현되어 생성 단계에서 막도록 바꿨다)"""
+        cases = [("cuda", {"requested": "cuda", "embedding": "cuda:1"}, "mismatch"),
+                 ("xpu", {"requested": "xpu", "embedding": "xpu:1"}, "mismatch"),
+                 ("xpu", {"requested": "cpu", "embedding": "cpu"}, "mismatch"),
+                 ("cpu", {"requested": "xpu", "embedding": "xpu:0"}, "mismatch"),
+                 ("cuda", {"requested": "cuda"}, "unverified"),
+                 ("xpu", {"requested": "xpu", "embedding": None}, "unverified"),
+                 ("xpu", {"requested": "xpu", "embedding": "xpu:0"}, "match"),
+                 ("cuda", {"requested": "cuda", "embedding": "cuda:0"}, "match")]
+        for kind, device, expected in cases:
+            with self.subTest(kind=kind, index=device):
+                index = SimpleNamespace(device=dict(device), chunks=31)
+                with mock.patch.object(du, "select_embedding_device", return_value=selection_of(kind)):
+                    if expected == "match":
+                        graph = sg.build_graph(a_device="auto", a_index=index)
+                        self.assertEqual(sg.runtime_report(graph)["a"]["index_check"]["status"], "match")
+                    else:
+                        with self.assertRaises(sg.IndexDeviceError) as caught:
+                            sg.build_graph(a_device="auto", a_index=index)
+                        self.assertEqual(caught.exception.check["status"], expected)
+                        self.assertIn("색인은 지우거나 다시 만들지 않았습니다", caught.exception.check["message"])
+                self.assertEqual(index.device, device)       # 주입한 색인 정보는 그대로
+
+    def test_DV21_matching_index_reaches_a_and_schedule(self):
+        """DV21 번호까지 같은 색인은 A 외출 판단(실제 3단계 RAG 경로)과 일정 에이전트에 같은 색인으로 전달되고 검색이 실행된다.
+        번호가 다른 색인은 그래프가 만들어지지 않으므로 어느 쪽에서도 검색이 실행되지 않는다."""
+        index = SimpleNamespace(device={"requested": "cuda", "embedding": "cuda:0"}, chunks=31)
+        other = SimpleNamespace(device={"requested": "cuda", "embedding": "cuda:1"}, chunks=31)
+        self.use(ScheduleLLM(understanding={tod.RAIN_CONSULT_Q: tod.RAIN_CONSULT_U,
+                                            "내일 일정 알려 줘": tod.u(intent="schedule_query")}),
+                 weather=tod.FakeWeather(by_hour={h: RAIN for h in (11, 12, 13)}))
+        seen: list[Any] = []
+
+        def schedule_runner(request, *, store, conversation_state=None, device=None, index=None, now=None, context=None):
+            seen.append((device, index))
+            return {**sa.empty_schedule_result(), "status": "ok", "route": "schedule", "answer": "일정 답변",
+                    "conversation_state": sa.new_schedule_state(), "decision": {"kind": "schedule_answer"}}
+
+        with mock.patch.object(du, "select_embedding_device", return_value=selection_of("cuda")):
+            with self.assertRaises(sg.IndexDeviceError):
+                self.graph(a_device="auto", a_index=other, schedule_runner=schedule_runner)
+            graph = self.graph(a_device="auto", a_index=index, schedule_runner=schedule_runner)
+        self.assertEqual(self.rag.calls, [])
+        self.say(graph, tod.RAIN_CONSULT_Q)
+        result = self.values(graph)["last_result"]
+        self.assertTrue(self.rag.calls)
+        self.assertEqual(result["embedding_device"], index.device)
+        self.say(graph, "내일 일정 알려 줘")
+        self.assertEqual(seen, [("cuda", index)])
+
+    def test_DV19_runtime_report_is_per_graph_copy(self):
+        """DV19 runtime_report()는 그래프마다 따로이고 사본이다. 돌려받은 값을 고쳐도 그래프 정보는 바뀌지 않는다."""
+        with mock.patch.object(du, "select_embedding_device", side_effect=[selection_of("xpu"), selection_of("cpu")]):
+            first, second = sg.build_graph(a_device="auto"), sg.build_graph(a_device="auto")
+        report = sg.runtime_report(first)
+        self.assertEqual((report["a"]["selection"]["selected"], sg.runtime_report(second)["a"]["selection"]["selected"]),
+                         ("xpu", "cpu"))
+        report["a"]["selection"]["selected"] = "cuda"
+        report["a"]["selection"]["attempts"].append({"device": "가짜"})
+        self.assertEqual(sg.runtime_report(first)["a"]["selection"]["selected"], "xpu")
+        self.assertEqual(sg.runtime_report(first)["a"]["selection"]["attempts"], [])
+        self.assertEqual(sg.runtime_report(object())["status"], "unknown_graph")
+        self.assertEqual(sg.runtime_report([])["status"], "unknown_graph")
+
+    def test_DV20_a_and_b_devices_stay_separate(self):
+        """DV20 A·B 장치와 색인은 따로다. B가 없으면 B 장치를 고르지 않고, B가 있으면 텐서 연산까지만 확인한 B 장치를 B에만 넘긴다."""
+        self.use(ScheduleLLM(understanding={"우유가 떨어졌어": tod.u(intent="living_support")}))
+        a_index, b_index = SimpleNamespace(device={"requested": "xpu", "embedding": "xpu:0"}), object()
+        with mock.patch.object(du, "select_embedding_device", return_value=selection_of("xpu")), \
+                mock.patch.object(du, "select_torch_device") as torch_select:
+            graph = sg.build_graph(a_device="auto", a_index=a_index, b_device="auto")
+        torch_select.assert_not_called()
+        self.assertIn("B기능이 연결되지 않아", sg.runtime_report(graph)["b"]["message"])
+        living = tsg.FakeLiving(tsg.b_question(1))
+        with mock.patch.object(du, "select_embedding_device", return_value=selection_of("xpu")), \
+                mock.patch.object(du, "select_torch_device", return_value=selection_of("cpu", check="torch_only")):
+            graph = sg.build_graph(a_device="auto", a_index=a_index, b_device="auto", b_index=b_index, b_runner=living)
+        sg.send_message(graph, self.thread, "우유가 떨어졌어")
+        self.assertEqual((living.calls[0]["device"], living.calls[0]["index"]), ("cpu", b_index))
+        report = sg.runtime_report(graph)
+        self.assertEqual((report["a"]["selection"]["selected"], report["b"]["selection"]["selected"]), ("xpu", "cpu"))
+        self.assertIn("B 임베딩 모델 검증은 B 코드 연결 후", report["b"]["message"])
+
+
+# %% L층. 실제 장치 (--device를 줄 때만 실행. 현재 PC 결과를 기대값으로 고정하지 않음)
+# 핵심 요약: 실제 PyTorch·실제 MiniLM으로 선택을 확인하고, 실제 그래프에서 실제 RAG 임베딩·검색이 선택 장치로 실행됐는지 본다.
+# LLM과 날씨는 가상이지만, 공식 수칙 검색(MiniLM·Chroma)은 실제 코드다. 운영 일정 저장소는 쓰지 않는다(임시 폴더).
+def real_cuda_available() -> bool:
+    import torch
+    backend = getattr(torch, "cuda", None)
+    try:
+        return bool(backend is not None and backend.is_available())
+    except Exception:  # noqa: BLE001
+        return False
+
+
+class L_DV_RealDevice(AgentCase):
+
+    def setUp(self):
+        if not OPTIONS.device:
+            raise unittest.SkipTest("--device auto|xpu|cuda|cpu 를 지정하면 실행합니다. (실제 PyTorch·MiniLM 필요)")
+        super().setUp()
+
+    def selection(self) -> dict[str, Any]:
+        selection = du.select_embedding_device(OPTIONS.device)
+        print(f"\n  [L-DV] 요청 {OPTIONS.device} → 선택 {selection['selected']} ({selection['device']}) | "
+              f"시도 {stages(selection)} | 세부 {selection['details']}")
+        return selection
+
+    def test_DV30_real_selection(self):
+        """DV30 실제 선택: 성공하면 임베딩 가중치·토큰·출력이 선택 장치이고 384차원이다. 자동이면 앞 순서 장치는 모두 실패 기록이 있다.
+        cuda를 직접 지정했는데 이 환경에서 CUDA를 쓸 수 없으면, 실패로 보고하고 다른 장치를 시도하지 않는다."""
+        selection = self.selection()
+        if OPTIONS.device == "cuda" and not real_cuda_available():
+            self.assertEqual((selection["ok"], selection["selected"]), (False, None))
+            self.assertEqual({a["device"] for a in selection["attempts"]}, {"cuda"})
+            return
+        self.assertTrue(selection["ok"], selection["error"])
+        details = selection["details"]
+        for key in ("weights", "token_input", "token_output", "embedding"):
+            self.assertEqual(details[key], selection["device"])
+        self.assertEqual(details["dimensions"], 384)
+        if OPTIONS.device == "auto":
+            before = du.AUTO_ORDER[:du.AUTO_ORDER.index(selection["selected"])]
+            for device in before:
+                self.assertTrue(any(a["device"] == device and not a["ok"] for a in selection["attempts"]))
+
+    def test_DV31_real_graph_rag_uses_selected_device(self):
+        """DV31 실제 build_graph(a_device=지정값)에서 A 외출 판단과 일정 에이전트의 실제 RAG가 선택 장치로 임베딩·검색한다."""
+        if OPTIONS.device == "cuda" and not real_cuda_available():
+            self.skipTest("이 환경에서는 CUDA를 쓸 수 없어 실제 그래프 RAG 검증을 하지 않습니다. (DV30에서 실패 보고 확인)")
+        check = "아까 바꾼 장보기 일정 괜찮겠지?"
+        self.use(ScheduleLLM(understanding={tod.RAIN_CONSULT_Q: tod.RAIN_CONSULT_U, check: tod.u(intent="schedule_query")},
+                             schedule={check: {"operation": "query", "query_scope": "target", "check_weather": True,
+                                               "target_text": "아까 바꾼 장보기 일정"}}),
+                 weather=tod.FakeWeather(by_hour={h: RAIN for h in (11, 12, 13, 17)}), rag="real")
+        self.apply_update("시장 장보기", at(26, 17))
+        graph = self.graph(a_device=OPTIONS.device, a_index=None)
+        report = sg.runtime_report(graph)
+        # (검토 보완) 비교 기준은 실제 선택 정보다. 자동이면 그래프가 고른 결과, 직접 지정이면 같은 장치를 실제로 검사한 결과
+        # (같은 프로세스의 모델 캐시를 쓰므로 그래프의 RAG와 같은 모델)를 쓴다. 현재 PC의 장치 이름을 기대값으로 고정하지 않는다.
+        selection = report["a"]["selection"] if OPTIONS.device == "auto" else du.select_embedding_device(OPTIONS.device)
+        self.assertTrue(selection["ok"], selection["error"])
+        expected = {"requested": selection["selected"], "weights": selection["device"], "token_input": selection["device"],
+                    "token_output": selection["device"], "embedding": selection["device"],
+                    "dimensions": selection["details"]["dimensions"]}
+        self.assertEqual(expected["dimensions"], 384)
+        self.say(graph, tod.RAIN_CONSULT_Q)
+        outing = self.values(graph)["last_result"]
+        self.say(graph, check)
+        schedule = self.values(graph)["last_result"]
+        for name, result in (("A 외출 판단", outing), ("일정 에이전트", schedule)):
+            with self.subTest(name):
+                used = result["embedding_device"] or {}
+                self.assertEqual({key: used.get(key) for key in expected}, expected)
+                self.assertTrue(result["safety_evidence"], "실제 RAG 검색 결과가 없습니다.")
+                self.assertIn("ok", set(result["rag_status"].values()))
+                print(f"  [L-DV] {name}: 임베딩 {result['embedding_device']} | 검색 {result['rag_status']}")
+
+
+class L_DV_Ollama(unittest.TestCase):
+
+    def setUp(self):
+        if not OPTIONS.live_ollama:
+            raise unittest.SkipTest("--live-ollama 를 지정하면 실행합니다. (ollama serve와 qwen2.5:3b 필요)")
+
+    def test_DV32_real_ollama_before_and_after_call(self):
+        """DV32 실제 Ollama: 호출 전·짧은 실제 호출 직후의 적재 상태를 측정해 그대로 보고한다. (GPU 종류는 확정하지 않음)"""
+        report = du.ollama_report(probe=True)
+        print(f"\n  [L-DV] Ollama {report['server']} {report['model']} | 호출 전 {report['before']} | 호출 {report['probe']} | "
+              f"호출 직후 {report['after']} | ollama ps {report['cli']}")
+        self.assertTrue(report["server_running"] and report["model_installed"], report["before"])
+        # (검토 보완) 실제 호출 성공과 호출 직후 장치 측정 성공을 따로 본다. 측정 실패 상태(미적재·응답 오류·잘못된 값)는 통과가 아니다.
+        # GPU를 쓰지 않는 정상적인 CPU 추론(no_gpu_memory)은 통과다. (상태를 올바르게 보고하는지는 단위 테스트 DV11·DV34가 확인)
+        self.assertEqual(report["probe"]["status"], "ok", report["probe"])
+        self.assertIn(report["after"]["state"], du.MEASURED_STATES, report["after"])
+        self.assertEqual(report["verdict"]["ok"], True, report["verdict"])
 
 
 # %% R층. 기존 파일 보존과 운영 저장소 격리 (요구 31·34)

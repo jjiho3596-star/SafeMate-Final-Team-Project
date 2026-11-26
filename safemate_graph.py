@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import copy
 import inspect
+import weakref
 import json
 import operator
 import sys
@@ -39,6 +40,7 @@ from langgraph.errors import GraphRecursionError
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command, interrupt
 
+import device_utils as du
 import schedule_agent as sa
 import schedule_service as sv
 import schedule_store as ss
@@ -365,6 +367,94 @@ def _accepts(func: Callable, name: str) -> bool:
         return False
 
 
+# %% (5-5단계) 연산 장치 자동 선택과 그래프별 실행 정보
+# 핵심 요약: a_device="auto"이면 그래프를 만들 때 한 번만 CUDA → XPU → CPU 순서로 MiniLM 임베딩 장치를 고른다. (요청마다 다시 고르지 않음)
+# 고른 장치 이름을 기존 a_device 자리에 넣으므로 A 외출 판단과 일정 에이전트의 RAG가 그 장치를 쓴다.
+# 실행 정보는 그래프 객체별 표에 보관하고(그래프가 사라지면 함께 사라짐), runtime_report()는 사본만 돌려준다.
+DeviceSelectionError = du.DeviceSelectionError
+_GRAPH_INFO: "weakref.WeakKeyDictionary[Any, dict[str, Any]]" = weakref.WeakKeyDictionary()
+
+
+class IndexDeviceError(ValueError):
+    """(5-5단계 검토 보완) 자동 선택 장치와 주입한 A 색인의 실제 임베딩 장치(번호 포함)가 같다고 확인되지 않을 때"""
+
+    def __init__(self, check: dict[str, Any]):
+        super().__init__(check["message"])
+        self.check = check
+
+
+def _index_check(index: Any, selected: str | None, actual: str | None) -> dict[str, Any]:
+    """주입한 A 색인의 임베딩 장치와 자동 선택 장치가 같은지. 색인을 지우거나 다시 만들지 않는다.
+
+    (검토 보완) 장치 종류(requested)뿐 아니라 실제 장치 번호(embedding, 예: cuda:0·cuda:1)까지 같아야 match다.
+    3단계 collect_evidence()는 종류만 비교하므로, 번호가 다르면 다른 GPU의 색인으로 검색이 실행될 수 있기 때문이다.
+    색인의 실제 장치 정보가 없으면 같다고 확인할 수 없으므로 unverified다."""
+    if index is None:
+        return {"status": "lazy", "message": "색인을 주지 않아 첫 공식 수칙 검색 때 선택한 장치로 준비합니다. (같은 모델 캐시 사용)"}
+    info = getattr(index, "device", None)
+    requested = info.get("requested") if isinstance(info, dict) else None
+    embedding = info.get("embedding") if isinstance(info, dict) else None
+    if not isinstance(embedding, str) or not embedding:
+        return {"status": "unverified", "index_device": requested, "selected": actual or selected,
+                "message": f"주입한 색인에 실제 임베딩 장치 정보가 없어 자동 선택 장치({actual or selected})와 같은지 확인할 수 없습니다. "
+                           "색인은 지우거나 다시 만들지 않았습니다. 같은 장치로 준비한 색인을 주거나 a_index를 비워 주세요."}
+    if requested == selected and embedding == actual:
+        return {"status": "match", "index_device": embedding, "message": "주입한 색인과 선택 장치가 같습니다."}
+    return {"status": "mismatch", "index_device": embedding, "selected": actual or selected,
+            "message": f"주입한 색인의 임베딩 장치({embedding})와 자동 선택 장치({actual or selected})가 다릅니다. "
+                       "다른 장치의 색인으로 공식 수칙을 검색하지 않도록 그래프를 만들지 않았습니다. 색인은 지우거나 다시 만들지 않았습니다. "
+                       "같은 장치로 준비한 색인을 주거나 a_index를 비워 주세요."}
+
+
+def _resolve_devices(a_device: Any, a_index: Any, b_device: Any, b_runner: Any) -> tuple[Any, Any, dict[str, Any]]:
+    """(A 장치, B 장치, 실행 정보). auto가 아니면 받은 값을 그대로 돌려준다. (기존 명시 장치·None 계약 유지)"""
+    info: dict[str, Any] = {}
+    # 1. A: MiniLM 임베딩까지 확인하는 선택. 모두 실패하면 그래프를 만들지 않는다. (조용히 다른 장치·환경변수로 바꾸지 않기 위함)
+    if a_device == "auto":
+        selection = du.select_embedding_device("auto")
+        if not selection["ok"]:
+            raise du.DeviceSelectionError(selection)
+        a_device = selection["selected"]
+        check = _index_check(a_index, selection["selected"], selection["device"])
+        if check["status"] in ("mismatch", "unverified"):
+            # 자동 선택 성공을 RAG 장치 사용 성공으로 잘못 보고하지 않도록, 확인되지 않은 색인으로는 그래프를 만들지 않는다.
+            raise IndexDeviceError(dict(check, selection=selection))
+        info["a"] = {"requested": "auto", "selection": selection, "index_check": check}
+    else:
+        info["a"] = {"requested": a_device, "selection": None, "index_check": None}
+
+    # 2. B: B기능 모델이 없으므로 A의 MiniLM으로 검증하지 않는다. B가 연결된 경우에만 PyTorch 텐서 연산까지 확인한다.
+    if b_device == "auto":
+        if b_runner is None:
+            b_device = None
+            info["b"] = {"requested": "auto", "selection": None, "message": "B기능이 연결되지 않아 장치를 고르지 않았습니다."}
+        else:
+            selection = du.select_torch_device("auto")
+            if not selection["ok"]:
+                raise du.DeviceSelectionError(selection)
+            b_device = selection["selected"]
+            info["b"] = {"requested": "auto", "selection": selection,
+                         "message": "B 임베딩 모델 검증은 B 코드 연결 후에 합니다. (텐서 연산까지만 확인)"}
+    else:
+        info["b"] = {"requested": b_device, "selection": None}
+    return a_device, b_device, info
+
+
+def runtime_report(graph: Any, *, include_ollama: bool = False) -> dict[str, Any]:
+    """그래프를 만들 때 정한 장치 선택 결과·실패 이력·색인 장치 확인·일정 저장소 연결 여부의 사본
+    (바깥에서 고쳐도 그래프 내부 정보는 바뀌지 않음). include_ollama=True면 Ollama 상태도 지금 측정해 붙인다."""
+    try:
+        info = _GRAPH_INFO.get(graph)
+    except TypeError:
+        info = None
+    if info is None:
+        return {"status": "unknown_graph", "message": "build_graph()로 만든 그래프가 아닙니다."}
+    report = copy.deepcopy(info)
+    if include_ollama:
+        report["ollama"] = du.ollama_report()
+    return report
+
+
 # %% 그래프 만들기
 # 핵심 요약: 상담·실행 함수와 색인을 주입받아 노드를 만들고, 조건 분기로 연결한 뒤 체크포인터와 함께 compile한다.
 # B 함수와 실행 함수는 아직 없으므로 기본값은 None이다. None이면 해당 노드가 '준비 중'이라고 정직하게 안내한다.
@@ -377,7 +467,12 @@ def build_graph(*, a_runner: Callable = run_outing_decision, a_device: str | Non
     """컴파일된 SafeMate 그래프를 돌려준다. 같은 그래프 객체를 모든 사용자(thread_id)가 함께 쓴다.
 
     (5단계) schedule_store: 일정 JSON 저장소(ScheduleStore). 앱이 시작할 때 store.ensure_initialized()를 먼저 부른다.
-    schedule_runner: 일정 상담 함수(기본 schedule_agent.run_schedule_request), life_record_reader: B 모의 요청 기록 읽기(B 연결 후)"""
+    schedule_runner: 일정 상담 함수(기본 schedule_agent.run_schedule_request), life_record_reader: B 모의 요청 기록 읽기(B 연결 후)
+    (5-5단계) a_device·b_device="auto": 그래프를 만들 때 한 번만 장치를 고른다. 쓸 장치가 없으면 DeviceSelectionError,
+    a_device="auto"인데 주입한 a_index의 실제 임베딩 장치가 선택 장치와 같다고 확인되지 않으면 IndexDeviceError
+    (기본값은 기존과 같이 None이다. 6단계 최종 앱에서 auto를 기본 실행 경로로 연결한다.)"""
+    a_device, b_device, graph_info = _resolve_devices(a_device, a_index, b_device, b_runner)
+    graph_info["schedule_store"] = schedule_store is not None
     with_schedule = schedule_store is not None
     # 기본 A 함수만 일정 요약을 넘길 수 있는 5단계 공개 함수로 바꾼다. 사용자가 주입한 A 함수는 그대로 쓴다.
     a_call: Callable = run_outing_decision_with_schedule if with_schedule and a_runner is run_outing_decision else a_runner
@@ -868,7 +963,9 @@ def build_graph(*, a_runner: Callable = run_outing_decision, a_device: str | Non
     builder.add_conditional_edges("approval", after_approval, ["execute", "close", "approval"])
     builder.add_edge("execute", END)
     builder.add_edge("close", END)
-    return builder.compile(checkpointer=checkpointer if checkpointer is not None else InMemorySaver())
+    compiled = builder.compile(checkpointer=checkpointer if checkpointer is not None else InMemorySaver())
+    _GRAPH_INFO[compiled] = graph_info      # (5-5단계) 그래프별 실행 정보 (runtime_report가 사본으로 보여 줌)
+    return compiled
 
 
 # %% 앱 함수: Gradio(6단계)가 그래프 내부를 몰라도 쓰도록 하는 얇은 함수
