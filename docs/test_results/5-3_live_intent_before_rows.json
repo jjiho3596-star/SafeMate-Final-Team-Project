@@ -1,0 +1,608 @@
+[
+ {
+  "message": "내일 시장 가는 시간 좀 바꿔 줘",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 시장 가는 시간 좀 바꿔 줘",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 시장 가는 시간 좀 바꿔 줘",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 오후 2시에 인천 가는데 비 오면 시간 바꿀까?",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "weather_question",
+  "route": "weather_question",
+  "status": "ok"
+ },
+ {
+  "message": "내일 오후 2시에 인천 가는데 비 오면 시간 바꿀까?",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "weather_question",
+  "route": "weather_question",
+  "status": "ok"
+ },
+ {
+  "message": "내일 오후 2시에 인천 가는데 비 오면 시간 바꿀까?",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "weather_question",
+  "route": "weather_question",
+  "status": "ok"
+ },
+ {
+  "message": "내일 일정 좀 바꿔 줘",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 일정 좀 바꿔 줘",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 일정 좀 바꿔 줘",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "시간은 네가 알아서 정해 줘",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "시간은 네가 알아서 정해 줘",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "시간은 네가 알아서 정해 줘",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "오후 네 시 말고 저녁 일곱 시로 해 줘",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "오후 네 시 말고 저녁 일곱 시로 해 줘",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "오후 네 시 말고 저녁 일곱 시로 해 줘",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 일정 바꾸지 마",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 일정 바꾸지 마",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 일정 바꾸지 마",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "시간을 바꿀 필요는 없어",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "시간을 바꿀 필요는 없어",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "시간을 바꿀 필요는 없어",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "비가 오면 시간을 바꿀까?",
+  "attempt": 1,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "weather_question",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "비가 오면 시간을 바꿀까?",
+  "attempt": 2,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "weather_question",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "비가 오면 시간을 바꿀까?",
+  "attempt": 3,
+  "expected": [
+   "schedule_change"
+  ],
+  "model_intent": "weather_question",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "아까 바꾼 일정 몇 시였지?",
+  "attempt": 1,
+  "expected": [
+   "schedule_history",
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "아까 바꾼 일정 몇 시였지?",
+  "attempt": 2,
+  "expected": [
+   "schedule_history",
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "아까 바꾼 일정 몇 시였지?",
+  "attempt": 3,
+  "expected": [
+   "schedule_history",
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "원래 시장에 몇 시에 가려고 했지?",
+  "attempt": 1,
+  "expected": [
+   "schedule_history",
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "원래 시장에 몇 시에 가려고 했지?",
+  "attempt": 2,
+  "expected": [
+   "schedule_history",
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "원래 시장에 몇 시에 가려고 했지?",
+  "attempt": 3,
+  "expected": [
+   "schedule_history",
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내가 내일 뭐 하기로 했지?",
+  "attempt": 1,
+  "expected": [
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내가 내일 뭐 하기로 했지?",
+  "attempt": 2,
+  "expected": [
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내가 내일 뭐 하기로 했지?",
+  "attempt": 3,
+  "expected": [
+   "schedule_query"
+  ],
+  "model_intent": "schedule_change",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "다음 약속이 뭐야?",
+  "attempt": 1,
+  "expected": [
+   "schedule_query"
+  ],
+  "model_intent": "outing_consultation",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "다음 약속이 뭐야?",
+  "attempt": 2,
+  "expected": [
+   "schedule_query"
+  ],
+  "model_intent": "outing_consultation",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "다음 약속이 뭐야?",
+  "attempt": 3,
+  "expected": [
+   "schedule_query"
+  ],
+  "model_intent": "outing_consultation",
+  "route": "needs_clarification",
+  "status": "needs_input"
+ },
+ {
+  "message": "내일 아침 여덟 시에 산책할 거야. 기억해 줘.",
+  "attempt": 1,
+  "expected": [
+   "schedule_create"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "내일 아침 여덟 시에 산책할 거야. 기억해 줘.",
+  "attempt": 2,
+  "expected": [
+   "schedule_create"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "내일 아침 여덟 시에 산책할 거야. 기억해 줘.",
+  "attempt": 3,
+  "expected": [
+   "schedule_create"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "내일 장보기는 안 갈래",
+  "attempt": 1,
+  "expected": [
+   "schedule_cancel"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "내일 장보기는 안 갈래",
+  "attempt": 2,
+  "expected": [
+   "schedule_cancel"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "내일 장보기는 안 갈래",
+  "attempt": 3,
+  "expected": [
+   "schedule_cancel"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "오늘 시장 다녀왔어",
+  "attempt": 1,
+  "expected": [
+   "schedule_complete"
+  ],
+  "model_intent": "daily_conversation",
+  "route": "daily_conversation",
+  "status": "ok"
+ },
+ {
+  "message": "오늘 시장 다녀왔어",
+  "attempt": 2,
+  "expected": [
+   "schedule_complete"
+  ],
+  "model_intent": "daily_conversation",
+  "route": "daily_conversation",
+  "status": "ok"
+ },
+ {
+  "message": "오늘 시장 다녀왔어",
+  "attempt": 3,
+  "expected": [
+   "schedule_complete"
+  ],
+  "model_intent": "daily_conversation",
+  "route": "daily_conversation",
+  "status": "ok"
+ },
+ {
+  "message": "내일 인천 비 와?",
+  "attempt": 1,
+  "expected": [
+   "weather_question"
+  ],
+  "model_intent": "weather_question",
+  "route": "weather_question",
+  "status": "ok"
+ },
+ {
+  "message": "내일 인천 비 와?",
+  "attempt": 2,
+  "expected": [
+   "weather_question"
+  ],
+  "model_intent": "weather_question",
+  "route": "error",
+  "status": "llm_invalid_output"
+ },
+ {
+  "message": "내일 인천 비 와?",
+  "attempt": 3,
+  "expected": [
+   "weather_question"
+  ],
+  "model_intent": "weather_question",
+  "route": "error",
+  "status": "llm_invalid_output"
+ },
+ {
+  "message": "내일 시장 가는데 뭐 입고 가?",
+  "attempt": 1,
+  "expected": [
+   "outing_consultation"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "내일 시장 가는데 뭐 입고 가?",
+  "attempt": 2,
+  "expected": [
+   "outing_consultation"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "내일 시장 가는데 뭐 입고 가?",
+  "attempt": 3,
+  "expected": [
+   "outing_consultation"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "폭염 때는 어떻게 해야 돼?",
+  "attempt": 1,
+  "expected": [
+   "safety_guidance"
+  ],
+  "model_intent": "safety_guidance",
+  "route": "error",
+  "status": "llm_invalid_output"
+ },
+ {
+  "message": "폭염 때는 어떻게 해야 돼?",
+  "attempt": 2,
+  "expected": [
+   "safety_guidance"
+  ],
+  "model_intent": "safety_guidance",
+  "route": "error",
+  "status": "llm_invalid_output"
+ },
+ {
+  "message": "폭염 때는 어떻게 해야 돼?",
+  "attempt": 3,
+  "expected": [
+   "safety_guidance"
+  ],
+  "model_intent": "safety_guidance",
+  "route": "error",
+  "status": "llm_invalid_output"
+ },
+ {
+  "message": "우유하고 계란이 떨어졌어",
+  "attempt": 1,
+  "expected": [
+   "living_support"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "우유하고 계란이 떨어졌어",
+  "attempt": 2,
+  "expected": [
+   "living_support"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "우유하고 계란이 떨어졌어",
+  "attempt": 3,
+  "expected": [
+   "living_support"
+  ],
+  "model_intent": "living_support",
+  "route": "living_support",
+  "status": "ok"
+ },
+ {
+  "message": "오늘 심심하다",
+  "attempt": 1,
+  "expected": [
+   "daily_conversation"
+  ],
+  "model_intent": "daily_conversation",
+  "route": "daily_conversation",
+  "status": "ok"
+ },
+ {
+  "message": "오늘 심심하다",
+  "attempt": 2,
+  "expected": [
+   "daily_conversation"
+  ],
+  "model_intent": "daily_conversation",
+  "route": "daily_conversation",
+  "status": "ok"
+ },
+ {
+  "message": "오늘 심심하다",
+  "attempt": 3,
+  "expected": [
+   "daily_conversation"
+  ],
+  "model_intent": "daily_conversation",
+  "route": "daily_conversation",
+  "status": "ok"
+ }
+]
