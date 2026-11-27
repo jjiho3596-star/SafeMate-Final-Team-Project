@@ -3,9 +3,73 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from urllib.error import URLError
 from unittest.mock import patch
 
 import b_living
+
+
+def check_living_result(result):
+    required = {
+        "status",
+        "detail_code",
+        "message",
+        "route",
+        "answer",
+        "conversation_state",
+        "missing_fields",
+        "clarification",
+        "requires_user_confirmation",
+        "proposed_action",
+        "usage",
+        "tool_trace",
+        "limitations",
+        "living_evidence",
+    }
+    assert required <= set(result), required - set(result)
+    assert "approval" not in result
+    assert result["status"] in {
+        "ok",
+        "needs_input",
+        "llm_unavailable",
+        "llm_invalid_output",
+        "tool_error",
+    }
+    assert result["route"] in {"living_support", "needs_clarification", "error"}
+    assert isinstance(result["answer"], str) and result["answer"].strip()
+    assert isinstance(result["conversation_state"], dict)
+    assert isinstance(result["missing_fields"], list)
+    assert isinstance(result["living_evidence"], list)
+    assert (result["status"] == "needs_input") == (
+        result["route"] == "needs_clarification"
+    )
+    assert bool(result["missing_fields"]) == (result["clarification"] is not None)
+    if result["clarification"] is not None:
+        assert result["clarification"]["fields"] == result["missing_fields"]
+    for evidence in result["living_evidence"]:
+        assert isinstance(evidence["content"], str) and evidence["content"].strip()
+        assert {"title", "publisher", "url", "pdf_page"} <= set(evidence)
+        assert evidence["pdf_page"] is None or (
+            isinstance(evidence["pdf_page"], int)
+            and not isinstance(evidence["pdf_page"], bool)
+        )
+
+    action = result["proposed_action"]
+    assert result["requires_user_confirmation"] == (action is not None)
+    if action is not None:
+        assert action["type"] == "request_caregiver_help"
+        assert isinstance(action["action_id"], str) and action["action_id"]
+        assert action["requires_approval"] is True and action["applied"] is False
+        assert result["status"] == "ok" and result["route"] == "living_support"
+        assert "approval" not in action
+        payload = action["payload"]
+        assert payload["recipient_role"] == "caregiver"
+        assert payload["items"]
+        assert isinstance(payload["message"], str)
+        assert 0 < len(payload["message"]) <= 300
+        for item in payload["items"]:
+            assert item["name"] in payload["message"]
+    json.dumps(result, ensure_ascii=False, allow_nan=False)
 
 
 class LivingActionTests(unittest.TestCase):
@@ -105,6 +169,206 @@ class LivingActionTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertIs(result["applied"], False)
         self.assertIsNone(result["record"])
+
+
+class LivingSupportTests(unittest.TestCase):
+    evidence = [
+        {
+            "content": "생활지원 안내 자료 원문",
+            "title": "생활지원 안내",
+            "publisher": "공공기관",
+            "url": None,
+            "pdf_page": None,
+        }
+    ]
+
+    def model_output(self, **overrides):
+        response = {
+            "intent": "living_support",
+            "category": "other",
+            "items": [],
+            "urgency": "normal",
+            "answer": "자료에서 확인한 생활지원 안내를 참고해 주세요.",
+        }
+        response.update(overrides)
+        return json.dumps(response, ensure_ascii=False)
+
+    def test_normal_consultation_and_no_evidence_limitation(self):
+        with (
+            patch.object(
+                b_living, "_search_living_evidence", return_value=self.evidence
+            ),
+            patch.object(
+                b_living, "_ollama_chat", return_value=self.model_output()
+            ),
+        ):
+            result = b_living.run_living_support(
+                {"user_message": "생활지원 안내를 알려 주세요", "context": None},
+                device="cpu",
+            )
+        check_living_result(result)
+        self.assertEqual(result["living_evidence"], self.evidence)
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["route"], "living_support")
+
+        with (
+            patch.object(b_living, "_search_living_evidence", return_value=[]),
+            patch.object(
+                b_living, "_ollama_chat", return_value=self.model_output()
+            ),
+        ):
+            no_evidence = b_living.run_living_support("생활지원 안내")
+        check_living_result(no_evidence)
+        self.assertEqual(no_evidence["living_evidence"], [])
+        self.assertTrue(no_evidence["limitations"])
+        self.assertIn("공식 생활지원 자료", no_evidence["answer"])
+
+    def test_missing_quantity_follow_up_becomes_approved_action_proposal(self):
+        first_output = self.model_output(
+            intent="request_caregiver_help",
+            category="groceries",
+            items=[{"name": "우유", "quantity": None, "unit": ""}],
+            answer="우유 수량을 확인할게요.",
+        )
+        follow_up_output = self.model_output(
+            intent="living_support",
+            category="groceries",
+            items=[{"name": "우유", "quantity": 2, "unit": "개"}],
+            answer="요청 내용을 정리했어요.",
+        )
+        with (
+            patch.object(
+                b_living, "_search_living_evidence", return_value=self.evidence
+            ),
+            patch.object(
+                b_living,
+                "_ollama_chat",
+                side_effect=[first_output, follow_up_output],
+            ),
+            patch.object(b_living, "execute_living_action") as execute,
+        ):
+            needs_input = b_living.run_living_support("우유가 필요해")
+            check_living_result(needs_input)
+            self.assertEqual(needs_input["status"], "needs_input")
+            self.assertEqual(needs_input["missing_fields"], ["quantity"])
+            self.assertIsNone(needs_input["proposed_action"])
+
+            proposed = b_living.run_living_support(
+                "두 개",
+                conversation_state=needs_input["conversation_state"],
+            )
+        check_living_result(proposed)
+        self.assertEqual(proposed["status"], "ok")
+        action = proposed["proposed_action"]
+        self.assertEqual(action["type"], "request_caregiver_help")
+        self.assertEqual(action["payload"]["items"][0]["quantity"], 2)
+        self.assertEqual(
+            action["payload"]["message"],
+            b_living.build_help_message(
+                "groceries", action["payload"]["items"], action["payload"]["note"]
+            ),
+        )
+        execute.assert_not_called()
+
+    def test_search_and_ollama_errors_obey_result_contract(self):
+        previous_state = {
+            "turn": 2,
+            "pending_category": "groceries",
+            "pending_items": [{"name": "우유", "quantity": None, "unit": ""}],
+        }
+        with patch.object(
+            b_living,
+            "_search_living_evidence",
+            side_effect=OSError("index unavailable"),
+        ):
+            search_error = b_living.run_living_support(
+                "두 개", conversation_state=previous_state
+            )
+        check_living_result(search_error)
+        self.assertEqual(search_error["status"], "tool_error")
+        self.assertEqual(search_error["route"], "error")
+        self.assertEqual(search_error["conversation_state"], previous_state)
+        self.assertIsNone(search_error["proposed_action"])
+
+        with (
+            patch.object(
+                b_living, "_search_living_evidence", return_value=self.evidence
+            ),
+            patch.object(
+                b_living, "_ollama_chat", side_effect=URLError("Ollama offline")
+            ),
+        ):
+            unavailable = b_living.run_living_support(
+                "두 개", conversation_state=previous_state
+            )
+        check_living_result(unavailable)
+        self.assertEqual(unavailable["status"], "llm_unavailable")
+        self.assertEqual(unavailable["conversation_state"], previous_state)
+
+        with (
+            patch.object(
+                b_living, "_search_living_evidence", return_value=self.evidence
+            ),
+            patch.object(b_living, "_ollama_chat", return_value="{invalid json"),
+        ):
+            invalid_output = b_living.run_living_support(
+                {"user_message": "안내를 알려 주세요", "context": {}},
+                conversation_state=previous_state,
+            )
+        check_living_result(invalid_output)
+        self.assertEqual(invalid_output["status"], "llm_invalid_output")
+        self.assertEqual(invalid_output["conversation_state"], previous_state)
+
+    def test_malformed_ollama_envelopes_and_model_fields_are_reported(self):
+        class FakeResponse:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"message":{"content":[]}}'
+
+        with (
+            patch.dict(
+                os.environ, {"OLLAMA_BASE_URL": "http://127.0.0.1:11434"}
+            ),
+            patch.object(
+                b_living, "_search_living_evidence", return_value=self.evidence
+            ),
+            patch.object(b_living, "urlopen", return_value=FakeResponse()),
+        ):
+            bad_envelope = b_living.run_living_support("생활지원 안내")
+        check_living_result(bad_envelope)
+        self.assertEqual(bad_envelope["status"], "llm_invalid_output")
+
+        malformed_fields = self.model_output(intent=[])
+        with (
+            patch.object(
+                b_living, "_search_living_evidence", return_value=self.evidence
+            ),
+            patch.object(b_living, "_ollama_chat", return_value=malformed_fields),
+        ):
+            bad_model_data = b_living.run_living_support("생활지원 안내")
+        check_living_result(bad_model_data)
+        self.assertEqual(bad_model_data["status"], "llm_invalid_output")
+
+    def test_ollama_environment_precedence_does_not_mutate_environment(self):
+        with patch.dict(
+            os.environ,
+            {
+                "OLLAMA_BASE_URL": "http://127.0.0.1:11434",
+                "B_OLLAMA_MODEL": "living-model",
+                "OLLAMA_MODEL": "shared-model",
+            },
+        ):
+            before = dict(os.environ)
+            self.assertEqual(
+                b_living._local_ollama_config(),
+                ("http://127.0.0.1:11434", "living-model"),
+            )
+            self.assertEqual(dict(os.environ), before)
 
 
 if __name__ == "__main__":

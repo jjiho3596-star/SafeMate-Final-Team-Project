@@ -33,6 +33,10 @@ _PERSONAL_DATA_PATTERN = re.compile(
 _TOKEN_PATTERN = re.compile(r"[가-힣A-Za-z0-9]+")
 
 
+class _OllamaInvalidResponseError(Exception):
+    pass
+
+
 def _now_iso() -> str:
     return datetime.now(_KST).isoformat(timespec="seconds")
 
@@ -162,10 +166,22 @@ def _ollama_chat(system_prompt: str, user_prompt: str) -> str:
         method="POST",
     )
     with urlopen(request, timeout=30) as response:
-        payload = json.loads(response.read().decode("utf-8"))
-    content = payload.get("message", {}).get("content")
+        try:
+            response_body = response.read().decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise _OllamaInvalidResponseError("ollama_response_not_utf8") from exc
+    try:
+        payload = json.loads(response_body)
+    except json.JSONDecodeError as exc:
+        raise _OllamaInvalidResponseError("ollama_response_not_json") from exc
+    if not isinstance(payload, dict):
+        raise _OllamaInvalidResponseError("ollama_response_not_object")
+    response_message = payload.get("message")
+    if not isinstance(response_message, dict):
+        raise _OllamaInvalidResponseError("ollama_message_not_object")
+    content = response_message.get("content")
     if not isinstance(content, str) or not content.strip():
-        raise ValueError("ollama_empty_response")
+        raise _OllamaInvalidResponseError("ollama_empty_response")
     return content
 
 
@@ -308,7 +324,7 @@ def _clean_state(state: dict | None) -> dict:
     if not isinstance(turn, int) or isinstance(turn, bool) or turn < 0:
         raise ValueError("conversation_state_turn_invalid")
     pending_category = state.get("pending_category")
-    if pending_category not in _ALLOWED_CATEGORIES:
+    if not isinstance(pending_category, str) or pending_category not in _ALLOWED_CATEGORIES:
         pending_category = None
     pending_items = state.get("pending_items", [])
     if not isinstance(pending_items, list):
@@ -419,6 +435,8 @@ def build_help_message(
 
 
 def _parse_model_output(raw: str) -> dict:
+    if not isinstance(raw, str):
+        raise ValueError("model_output_not_string")
     try:
         result = json.loads(raw)
     except json.JSONDecodeError as exc:
@@ -510,6 +528,16 @@ def run_living_support(
     trace = [{"tool": "living_search", "status": "ok", "result_count": len(evidence)}]
     try:
         raw_output = _ollama_chat(system_prompt, user_prompt)
+    except _OllamaInvalidResponseError as exc:
+        return _error_result(
+            "llm_invalid_output",
+            "ollama_response",
+            str(exc),
+            previous_state,
+            tool_trace=trace + [{"tool": "ollama", "status": "error"}],
+            living_evidence=evidence,
+            llm_calls=1,
+        )
     except URLError as exc:
         return _error_result(
             "llm_unavailable",
@@ -555,11 +583,16 @@ def run_living_support(
     try:
         parsed = _parse_model_output(raw_output)
         intent = parsed.get("intent")
-        if intent not in {"request_caregiver_help", "living_support"}:
+        if not isinstance(intent, str) or intent not in {
+            "request_caregiver_help",
+            "living_support",
+        }:
             raise ValueError("model_intent_invalid")
         category = parsed.get("category")
-        if category not in _ALLOWED_CATEGORIES:
+        if not isinstance(category, str) or category not in _ALLOWED_CATEGORIES:
             category = state.get("pending_category") or "other"
+        if state.get("pending_category"):
+            intent = "request_caregiver_help"
         items = _normalize_items(parsed.get("items", []))
         item_source = user_message + " " + " ".join(
             str(value) for value in (context or {}).values() if isinstance(value, str)
@@ -571,7 +604,7 @@ def run_living_support(
             raise ValueError("model_item_not_in_user_request")
         items = _merge_items(state["pending_items"], items)
         urgency = parsed.get("urgency", "normal")
-        if urgency not in _ALLOWED_URGENCY:
+        if not isinstance(urgency, str) or urgency not in _ALLOWED_URGENCY:
             urgency = "normal"
         answer = parsed.get("answer")
         if not isinstance(answer, str) or not answer.strip():
@@ -592,6 +625,11 @@ def run_living_support(
     limitations = []
     if not evidence:
         limitations.append("공식 생활지원 자료에서 근거를 찾지 못했습니다.")
+        if intent == "living_support":
+            answer = (
+                "공식 생활지원 자료에서 확인한 내용이 없어 제도나 기관 정보를 "
+                "안내드리기 어려워요. 필요한 생활 도움을 말씀해 주세요."
+            )
 
     if intent == "request_caregiver_help":
         missing_fields = []
