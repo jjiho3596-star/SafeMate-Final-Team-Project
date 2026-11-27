@@ -1981,8 +1981,24 @@ class I_AG9_PreferenceGate(AgentCase):
         first = self.agent("공원 걷기 비 안 오는 시간으로 알아서 바꿔 줘")
         self.assertEqual(first["missing_fields"], ["city"])
         second = self.agent("인천", first["conversation_state"])
-        action = got(second, "proposed_action")
-        self.assertNotIn(action["payload"]["after"]["start_at"][11:13], ("10", "11"))
+        # (5-6 D21) 수정 전 기대 카드(09:30~10:30)는 10시 비 구간과 겹쳤다(시작 구간만 확인한 결함). 일정 전체 구간을 보면
+        # 세 후보(10:30·09:30·11:00)가 모두 10·11시 비와 겹치므로 제안하지 않는 것이 맞다. 지역 질문은 반복하지 않고 인천 예보만 쓴다.
+        self.assertIsNone(second["proposed_action"])
+        self.assertNotEqual(second["missing_fields"], ["city"])
+        self.assertIn("비 신호가 없다고 확인된 빈 시간을 찾지 못해", second["answer"])
+        self.assertTrue(all(call["city"] == "인천" for call in self.weather.calls))
+        # 비가 10시에만 오면 전체 구간이 맑은 11:00~12:00을 인천 예보로 제안한다(일정 지역은 바꾸지 않음).
+        self.setUp()
+        self.add_walk()
+        self.use(ScheduleLLM(schedule={"공원 걷기 비 안 오는 시간으로 알아서 바꿔 줘": dict(self.WALK, delegate_choice=True),
+                                       "인천": self.CITY}),
+                 weather=tod.FakeWeather(by_hour={10: RAIN}))
+        first = self.agent("공원 걷기 비 안 오는 시간으로 알아서 바꿔 줘")
+        action = got(self.agent("인천", first["conversation_state"]), "proposed_action")
+        start = ss.parse_iso(action["payload"]["after"]["start_at"])
+        end = ss.parse_iso(action["payload"]["after"]["end_at"])
+        assert start is not None and end is not None
+        self.assertFalse(start < at(26, 11) and at(26, 10) < end)          # 카드 구간이 10시 비 구간과 겹치지 않음
         self.assertIsNone(action["payload"]["after"]["city"])
         self.assertTrue(all(call["city"] == "인천" for call in self.weather.calls))
 
@@ -2040,6 +2056,775 @@ class I_AG10_PeriodAfterQuestion(AgentCase):
         second = self.agent("인천", first["conversation_state"])
         after = got(second, "proposed_action")["payload"]["after"]
         self.assertEqual((after["start_at"], after["city"]), (ss.iso(at(26, 19)), None))
+
+
+# %% I-AG11. 5-6 사전 검증 결함 D1 회귀 (모호한 지역 질문 뒤 초안 정보 손실)
+# 핵심 요약: 수정 전에는 '광주'처럼 모호한 지역을 되물으면 그 턴에 말한 날짜·시각·상대 시각·시간대·소요 시간(등록),
+# 대상·새 시각(변경)이 초안에 남지 않아, 지역만 답하면 날짜·대상을 다시 묻거나 오늘 날짜의 엉뚱한 시각을 제안했다.
+# 지역만 답하면 이어 쓰고, 날짜·시각·대상을 함께 정정하면 새 값이 우선한다. 승인 전에는 파일이 바뀌지 않는다.
+GWANGJU_CREATE = "모레 오후 세 시에 광주에서 친구 만나기로 했어."
+GWANGJU_CREATE_U = {"operation": "create", "title": "친구 만나기", "date_text": "모레", "time_text": "오후 세 시",
+                    "city_text": "광주", "category_guess": "outing"}
+WALK_GWANGJU = "공원 걷기 광주 기준으로 비 안 오게 오후 다섯 시로 바꿔 줘"
+WALK_GWANGJU_U = {"operation": "update", "target_text": "공원 걷기", "new_time_text": "오후 다섯 시", "city_text": "광주",
+                  "preferences": ["avoid_rain"]}
+
+
+def answer_u(operation: str, **values: Any) -> dict[str, Any]:
+    """지역 질문에 대한 대답의 올바른 이해 (진행 중인 작업과 같은 operation)"""
+    return dict({"operation": operation, "answers_previous_question": True}, **values)
+
+
+class I_AG11_AmbiguousCityKeepsDraft(AgentCase):
+
+    def add_walk(self):
+        """지역이 저장되지 않은 실외 일정 '공원 걷기' (내일 10:00~11:00, schedule_005)"""
+        made = sv.propose_create(self.doc(), title="공원 걷기", start=at(26, 10), minutes=60, now=self.now, city=None,
+                                 category="outing")
+        sv.apply_schedule_action(approved(got(made, "action")), self.schedules)
+
+    def flow(self, first: str, first_u: dict[str, Any], replies: list[tuple[str, dict[str, Any]]], *,
+             weather=None, shift_minutes: int = 0) -> list[dict[str, Any]]:
+        """첫 턴(지역 질문을 기대) → 대답들. 결과 목록을 돌려주고 승인 전 파일 불변을 확인한다."""
+        script = {first: first_u, **{text: u for text, u in replies}}
+        self.use(ScheduleLLM(schedule=script), weather=weather or tod.FakeWeather())
+        before = self.raw()
+        first_result = self.agent(first)
+        self.assertEqual(first_result["missing_fields"], ["city"], first_result["answer"])
+        self.assertIn("'광주광역시' 또는 '광주, 경기도'", first_result["answer"])
+        results, state = [first_result], first_result["conversation_state"]
+        self.now = self.now + timedelta(minutes=shift_minutes)     # 지역 질문을 거치는 동안 시간이 흐른 경우
+        for text, _ in replies:
+            result = self.agent(text, state)
+            results.append(result)
+            state = result["conversation_state"]
+        self.assertEqual(self.raw(), before)                        # 승인 전 저장 없음
+        return results
+
+    def test_AG48_create_city_answer_keeps_date_time_title(self):
+        """AG48 '모레 오후 세 시에 광주에서 친구 만나기로 했어.' → 지역 질문 → '경기도 광주'·'광주광역시'(각각 독립)
+        → 모레 15:00 '친구 만나기' 등록 카드. 지역은 대답한 값이고 날짜를 다시 묻지 않는다."""
+        for city in ("경기도 광주", "광주광역시"):
+            with self.subTest(city):
+                self.setUp()
+                results = self.flow(GWANGJU_CREATE, GWANGJU_CREATE_U, [(city, answer_u("create", city_text=city))])
+                after = got(results[-1], "proposed_action")["payload"]["after"]
+                self.assertEqual((after["start_at"], after["title"], after["city"]), (ss.iso(at(27, 15)), "친구 만나기", city))
+                self.assertIn("city_question_held_restored", results[-1]["llm"]["rules_applied"])
+
+    def test_AG49_create_correction_with_city_answer_wins(self):
+        """AG49 지역과 함께 날짜만 고치면 시각 유지(글피 15:00), 시각만 고치면 날짜 유지(모레 16:00),
+        시간대('저녁')를 말한 뒤 직접 시각을 말하면 직접 시각이 우선(내일 09:00)"""
+        cases = [(GWANGJU_CREATE, GWANGJU_CREATE_U, "광주광역시, 글피로", {"city_text": "광주광역시", "date_text": "글피"}, at(28, 15)),
+                 (GWANGJU_CREATE, GWANGJU_CREATE_U, "광주광역시, 오후 네 시로", {"city_text": "광주광역시", "time_text": "오후 네 시"},
+                  at(27, 16)),
+                 ("내일 저녁 광주에서 산책할 거야", {"operation": "create", "title": "산책", "date_text": "내일", "time_text": "저녁",
+                                           "city_text": "광주", "category_guess": "outing"},
+                  "광주광역시, 아침 아홉 시로", {"city_text": "광주광역시", "time_text": "아침 아홉 시"}, at(26, 9))]
+        for first, first_u, reply, reply_u, expected in cases:
+            with self.subTest(reply):
+                self.setUp()
+                results = self.flow(first, first_u, [(reply, answer_u("create", **reply_u))])
+                self.assertEqual(got(results[-1], "proposed_action")["payload"]["after"]["start_at"], ss.iso(expected))
+
+    def test_AG50_relative_period_duration_and_repeated_question(self):
+        """AG50 ① 시간대·비 조건·위임·소요 시간 유지(내일 19:00~21:00) ② '지금부터' 상대 시각은 말한 순간 기준(10분 지나도 12:00)
+        ③ 상대 → 직접 정정(오늘 16:00) ④ 직접 → 상대 정정(오늘 13:00) ⑤ 자정을 넘는 상대 시각(내일 01:00)
+        ⑥ 다시 '광주'라고 답하면 다시 묻고, 그다음 대답으로 처음 날짜·시각 그대로 카드"""
+        rain = tod.FakeWeather(by_hour={18: RAIN})
+        delegate = "내일 저녁 광주에서 비 안 오는 시간으로 알아서 두 시간 동안 산책 등록해 줘"
+        delegate_u = {"operation": "create", "title": "산책", "date_text": "내일", "time_text": "저녁", "duration_text": "두 시간",
+                      "city_text": "광주", "delegate_choice": True, "preferences": ["avoid_rain"], "category_guess": "outing"}
+        results = self.flow(delegate, delegate_u, [("광주광역시", answer_u("create", city_text="광주광역시"))], weather=rain)
+        after = got(results[-1], "proposed_action")["payload"]["after"]
+        self.assertEqual((after["start_at"], after["end_at"], after["city"]), (ss.iso(at(26, 19)), ss.iso(at(26, 21)), "광주광역시"))
+        relative = "지금부터 두 시간 뒤에 광주에서 산책할 거야"
+        relative_u = {"operation": "create", "title": "산책", "shift_text": "지금부터 두 시간 뒤", "shift_base": "now",
+                      "city_text": "광주", "category_guess": "outing"}
+        clock_first = "오후 세 시에 광주에서 산책할 거야"
+        clock_first_u = {"operation": "create", "title": "산책", "time_text": "오후 세 시", "city_text": "광주",
+                         "category_guess": "outing"}
+        midnight = "지금부터 15시간 뒤에 광주에서 산책할 거야"
+        midnight_u = dict(relative_u, shift_text="지금부터 15시간 뒤")
+        cases = [("말한 순간 기준", relative, relative_u, "경기도 광주", {"city_text": "경기도 광주"}, 10, at(25, 12)),
+                 ("상대→직접", relative, relative_u, "광주광역시, 오후 네 시로", {"city_text": "광주광역시", "time_text": "오후 네 시"}, 0,
+                  at(25, 16)),
+                 ("직접→상대", clock_first, clock_first_u, "광주광역시, 지금부터 세 시간 뒤로",
+                  {"city_text": "광주광역시", "shift_text": "지금부터 세 시간 뒤", "shift_base": "now"}, 0, at(25, 13)),
+                 ("자정 넘김", midnight, midnight_u, "광주광역시", {"city_text": "광주광역시"}, 0, at(26, 1))]
+        for name, first, first_u, reply, reply_u, minutes, expected in cases:
+            with self.subTest(name):
+                self.setUp()
+                results = self.flow(first, first_u, [(reply, answer_u("create", **reply_u))], shift_minutes=minutes)
+                self.assertEqual(got(results[-1], "proposed_action")["payload"]["after"]["start_at"], ss.iso(expected))
+        with self.subTest("다시 모호한 대답"):
+            self.setUp()
+            results = self.flow(GWANGJU_CREATE, GWANGJU_CREATE_U, [("광주", answer_u("create", city_text="광주")),
+                                                                    ("광주광역시", answer_u("create", city_text="광주광역시"))])
+            self.assertEqual(results[1]["missing_fields"], ["city"])
+            self.assertEqual(got(results[2], "proposed_action")["payload"]["after"]["start_at"], ss.iso(at(27, 15)))
+
+    def test_AG51_update_city_answer_keeps_target_and_new_time(self):
+        """AG51 지역이 없는 '공원 걷기' 변경: 지역만 답하면 대상과 새 시각(17:00)·상대 시각(11:00)·시간대(19:00)를 이어 쓴다.
+        날짜만 고치면 새 시각 유지(모레 17:00), 대상을 고치면 새 대상(시장)에 같은 새 시각. 일정의 지역은 바꾸지 않는다."""
+        cases = [("직접", WALK_GWANGJU, WALK_GWANGJU_U, "경기도 광주", {"city_text": "경기도 광주"}, None, ("schedule_005", at(26, 17), None)),
+                 ("상대", "공원 걷기 광주 기준으로 비 안 오게 한 시간 늦춰 줘",
+                  {"operation": "update", "target_text": "공원 걷기", "shift_text": "한 시간 늦춰", "shift_base": "schedule",
+                   "city_text": "광주", "preferences": ["avoid_rain"]}, "광주광역시", {"city_text": "광주광역시"}, None,
+                  ("schedule_005", at(26, 11), None)),
+                 ("시간대", "공원 걷기 저녁에 광주 기준으로 비 안 오는 시간으로 바꿔 줘",
+                  {"operation": "update", "target_text": "공원 걷기", "new_time_text": "저녁", "city_text": "광주",
+                   "preferences": ["avoid_rain"]}, "광주광역시", {"city_text": "광주광역시"}, {18: RAIN},
+                  ("schedule_005", at(26, 19), None)),
+                 ("날짜 정정", WALK_GWANGJU, WALK_GWANGJU_U, "광주광역시, 모레로", {"city_text": "광주광역시", "new_date_text": "모레"},
+                  None, ("schedule_005", at(27, 17), None)),
+                 ("대상 정정", WALK_GWANGJU, WALK_GWANGJU_U, "광주광역시, 시장 일정이야", {"city_text": "광주광역시", "target_text": "시장"},
+                  None, (SID["시장"], at(26, 17), "인천"))]
+        for name, first, first_u, reply, reply_u, by_hour, (target, start, city) in cases:
+            with self.subTest(name):
+                self.setUp()
+                self.add_walk()
+                results = self.flow(first, first_u, [(reply, answer_u("update", **reply_u))],
+                                    weather=tod.FakeWeather(by_hour=by_hour or {}))
+                action = got(results[-1], "proposed_action")
+                self.assertEqual((action["payload"]["schedule_id"], action["payload"]["after"]["start_at"],
+                                  action["payload"]["after"]["city"]), (target, ss.iso(start), city))
+                if city is None:
+                    self.assertIn("일정에 저장된 지역은 바꾸지 않아요", results[-1]["answer"])
+
+    def test_AG52_held_values_are_not_reused_after_negation_or_end(self):
+        """AG52 지역 질문 뒤 '아니, 바꾸지 마'(부정) 또는 '그만'(상담 끝내기)이면 보관한 대상·새 시각이 다음 요청에 다시 쓰이지 않는다."""
+        self.add_walk()
+        self.use(ScheduleLLM(understanding={WALK_GWANGJU: tod.u(intent="schedule_change"),
+                                            "공원 걷기 시간 바꿔 줘": tod.u(intent="schedule_change")},
+                             schedule={WALK_GWANGJU: WALK_GWANGJU_U,
+                                       "아니, 바꾸지 마": {"operation": "update", "request_mode": "negated"},
+                                       "공원 걷기 시간 바꿔 줘": {"operation": "update", "target_text": "공원 걷기"}}))
+        before = self.raw()
+        first = self.agent(WALK_GWANGJU)
+        self.assertEqual(first["missing_fields"], ["city"])
+        negated = self.agent("아니, 바꾸지 마", first["conversation_state"])
+        self.assertIsNone(negated["conversation_state"]["draft"])
+        again = self.agent("공원 걷기 시간 바꿔 줘", negated["conversation_state"])
+        self.assertIsNone(again["proposed_action"])
+        self.assertEqual(again["missing_fields"], ["time"])
+        graph = self.graph()
+        self.assertEqual(self.say(graph, WALK_GWANGJU)["active_feature"], "S")
+        self.assertEqual(self.say(graph, "그만")["answer"], sg.S_CONSULTATION_ENDED)
+        view = self.say(graph, "공원 걷기 시간 바꿔 줘")
+        self.assertIsNone(view["pending"])
+        self.assertIn("몇 시로 바꿀까요?", view["answer"])
+        self.assertEqual(self.raw(), before)
+
+    def test_AG53_stored_city_and_clear_city_keep_existing_behavior(self):
+        """AG53 지역이 저장된 시장(인천)은 대답 뒤에도 예보·일정 지역이 인천 그대로이고(17:00),
+        처음부터 '광주광역시'라고 말하면 지역 질문 없이 바로 등록 카드다. (기존 동작 유지)"""
+        message = "시장 광주 기준으로 비 안 오게 오후 다섯 시로 바꿔 줘"
+        results = self.flow(message, {"operation": "update", "target_text": "시장", "new_time_text": "오후 다섯 시", "city_text": "광주",
+                                      "preferences": ["avoid_rain"]},
+                            [("광주광역시", answer_u("update", city_text="광주광역시"))])
+        action = got(results[-1], "proposed_action")
+        self.assertEqual((action["payload"]["schedule_id"], action["payload"]["after"]["start_at"],
+                          action["payload"]["after"]["city"]), (SID["시장"], ss.iso(at(26, 17)), "인천"))
+        self.assertTrue(all(call["city"] == "인천" for call in self.weather.calls))
+        clear = "모레 오후 세 시에 광주광역시에서 친구 만나기로 했어"
+        self.use(ScheduleLLM(schedule={clear: dict(GWANGJU_CREATE_U, city_text="광주광역시")}))
+        result = self.agent(clear)
+        after = got(result, "proposed_action")["payload"]["after"]
+        self.assertEqual((after["start_at"], after["city"]), (ss.iso(at(27, 15)), "광주광역시"))
+
+
+# %% M-SV10. 5-6 3차 검토 P1 회귀 (한글·숫자 시간 표현의 부분 해석)
+# 핵심 요약: 수정 전에는 '열다섯 시간'의 '다섯 시간', '115시간'의 '15시간', '열두 주'의 '두 주'처럼 뒷부분만 읽어
+# 다른 값으로 계산했고 소요 시간 12시간 제한도 우회됐다. 13~19는 올바르게 읽고, 읽을 수 없는 표현은 계산하지 않고 다시 묻는다.
+TEEN_HOURS = {"열세": 13, "열네": 14, "열다섯": 15, "열여섯": 16, "열일곱": 17, "열여덟": 18, "열아홉": 19}
+PARTIAL_TIMES = ("스물두 시간", "스물네 시간", "두세 시간", "한두 시간", "열 두 시간", "115시간", "125시간", "1234분", "1.5시간")
+
+
+class M_SV10_NumberWords(unittest.TestCase):
+
+    def test_SV40_teen_hours_are_read_whole(self):
+        """SV40 열세~열아홉 시간: 상대 시각은 13~19시간 뒤, 소요 시간은 12시간을 넘어 None(다시 묻기). 정규화 결과는 숫자 그대로"""
+        for word, hours in TEEN_HOURS.items():
+            with self.subTest(word):
+                self.assertEqual(sv.normalize_numbers(f"{word} 시간"), f"{hours}시간")
+                self.assertEqual(got(sv.resolve_shift(f"지금부터 {word} 시간 뒤", FIXED_NOW), "at"), FIXED_NOW + timedelta(hours=hours))
+                self.assertIsNone(sv.parse_minutes(f"{word} 시간"))
+        self.assertEqual(got(sv.resolve_shift("열세 시간 반 뒤", FIXED_NOW), "at"), FIXED_NOW + timedelta(hours=13, minutes=30))
+
+    def test_SV41_partial_numbers_are_not_cut(self):
+        """SV41 붙은 숫자 낱말(스물두·두세·한두·열 두)·세 자리 이상 시간·네 자리 이상 분·소수점 시간은 뒷부분만 읽지 않는다.
+        소요 시간은 None(다시 묻기), 상대 시각은 ambiguous(다시 묻기)"""
+        for text in PARTIAL_TIMES:
+            with self.subTest(text):
+                self.assertIsNone(sv.parse_minutes(text))
+                self.assertIn("ambiguous", sv.resolve_shift(f"{text} 뒤", FIXED_NOW) or {})
+
+    def test_SV42_weeks_keep_supported_and_refuse_partial(self):
+        """SV42 '열두 주'·'한두 주'·'스물두 주'·'열 두 주'는 2주로 읽지 않는다(상대 시각·날짜 모두 다시 묻기).
+        '2주 후'·'12주 뒤'·'일주일 뒤'는 그대로"""
+        for text in ("열두 주 뒤", "한두 주 뒤", "스물두 주 뒤", "열 두 주 뒤"):
+            with self.subTest(text):
+                self.assertIn("ambiguous", sv.resolve_shift(text, FIXED_NOW) or {})
+                self.assertIn("ambiguous", sv.parse_day(text, FIXED_NOW) or {})
+        self.assertEqual(got(sv.parse_day("2주 후", FIXED_NOW), "date"), "2026-12-09")
+        self.assertEqual(got(sv.resolve_shift("12주 뒤", FIXED_NOW), "at"), FIXED_NOW + timedelta(weeks=12))
+        self.assertEqual(got(sv.resolve_shift("일주일 뒤", FIXED_NOW), "at"), FIXED_NOW + timedelta(weeks=1))
+
+    def test_SV43_supported_expressions_unchanged(self):
+        """SV43 기존 지원 표현의 소요 시간·상대 시각은 그대로 (수정 전부터 통과하는 보존 테스트)"""
+        durations = {"한 시간": 60, "열 시간": 600, "열한 시간": 660, "열두 시간": 720, "한 시간 반": 90, "1시간 30분": 90,
+                     "삼십 분": 30, "두 시간": 120, "999분": None, "15시간": None, "열두 시간 반": None, "스무 시간": None}
+        for text, minutes in durations.items():
+            with self.subTest(text):
+                self.assertEqual(sv.parse_minutes(text), minutes)
+        shifts = {"지금부터 15시간 뒤": 15 * 60, "999분 뒤": 999, "열두 시간 반 뒤": 750, "한 시간 늦춰": 60, "30분 앞당겨": -30}
+        for text, minutes in shifts.items():
+            with self.subTest(text):
+                self.assertEqual(got(sv.resolve_shift(text, FIXED_NOW), "minutes"), minutes)
+
+    def test_SV44_spaced_and_word_ranges_are_asked(self):
+        """SV44 (5-6 최종 보완) 띄어 쓴 범위(두 세·한 두·세 네)·범위 낱말(대여섯·일고여덟)·숫자 범위(2~3)·
+        두 값('두 시간에서 세 시간', '10분에서 20분')은 한 값으로 고르지 않는다(소요 None, 상대 시각 ambiguous).
+        '한 세 시간'(약 세 시간)은 범위가 아니라 세 시간"""
+        for text in ("두 세 시간", "한 두 시간", "세 네 시간", "대여섯 시간", "일고여덟 시간", "2~3시간", "두 시간에서 세 시간",
+                     "10분에서 20분"):
+            with self.subTest(text):
+                self.assertIsNone(sv.parse_minutes(text))
+                self.assertIn("ambiguous", sv.resolve_shift(f"{text} 뒤", FIXED_NOW) or {})
+        self.assertEqual(sv.parse_minutes("한 세 시간"), 180)
+        self.assertEqual(got(sv.resolve_shift("한 세 시간 뒤", FIXED_NOW), "minutes"), 180)
+
+
+# %% M-OD1. 5-6 최종 보완: 3단계 출발 여유 시간(parse_lead_text) 숫자 해석 회귀
+# 핵심 요약: 수정 전 3단계 parse_lead_text는 숫자 경계를 보지 않아 '열한·열두 시간'(사전에는 있음)·'열다섯 시간'·'스물두 시간'·'115시간'·
+# '1.5시간'·'1234분'의 뒷부분만 읽었고, '두세 시간' 같은 범위도 한 값으로 골랐다. 지원 범위는 정확히 읽고,
+# 하나로 정할 수 없는 표현은 기존 계약대로 None(확인 불가)을 돌린다. (test_outing_decision.py는 R1 보호 대상이라 이 파일에 둔다)
+class M_OD1_LeadNumberWords(unittest.TestCase):
+
+    def test_OD01_native_hours_are_read_whole(self):
+        """OD01 열한~열아홉 시간 전은 11~19시간(분)으로 읽는다."""
+        cases = {"열한 시간 전": 660, "열두 시간 전": 720, **{f"{word} 시간 전": hours * 60 for word, hours in TEEN_HOURS.items()}}
+        for text, minutes in cases.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+
+    def test_OD02_ranges_and_partial_numbers_are_not_cut(self):
+        """OD02 범위(두세·두 세·한두·한 두·세네·대여섯·2~3·'두 시간에서 세 시간'·'10분에서 20분')·붙은 수(스물두)·띄어 쓴 십 단위(열 두)·
+        세 자리 이상 시간·네 자리 이상 분·소수점은 일부만 읽지 않고 None(확인 불가)"""
+        for text in ("스물두 시간 전", "두세 시간 전", "두 세 시간 전", "한두 시간 전", "한 두 시간 전", "세네 시간 전", "대여섯 시간 전",
+                     "2~3시간 전", "두 시간에서 세 시간 전", "10분에서 20분 전", "115시간 전", "1.5시간 전", "1234분 전", "열 두 시간 전"):
+            with self.subTest(text):
+                self.assertIsNone(od.parse_lead_text(text))
+
+    def test_OD03_supported_expressions_unchanged(self):
+        """OD03 기존 지원 표현은 그대로 (수정 전부터 통과하는 보존 테스트). '한 세 시간'(약 세 시간)은 범위가 아니라 세 시간으로 읽는다.
+        '예약 시간 1시간 전'처럼 숫자 없는 '시간'은 값으로 세지 않는다."""
+        cases = {"30분 전": 30, "한 시간 전": 60, "두 시간 전": 120, "한 시간 반": 90, "1시간 30분": 90, "1시간 반 전": 90,
+                 "1시간 10분": 70, "열 시간 전": 600, "48시간 전": 2880, "999분 전": 999, "한 세 시간 전": 180, "예약 시간 1시간 전": 60}
+        for text, minutes in cases.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+        for text in ("49시간 전", "조금 일찍", "0분 전"):
+            with self.subTest(text):
+                self.assertIsNone(od.parse_lead_text(text))
+
+    def test_OD04_hour_and_minute_amounts_are_summed_whole(self):
+        """OD04 (5-6 D22) 'N시간 M분'은 분 값 전체를 더한다(뒤 자리를 버리지 않음): 1시간 100분 160, 1시간 120분 180, 한 시간 120분 180.
+        출발 여유(48시간)·일정 소요 시간(12시간) 상한은 그대로이고, '반' 뒤에 분이 또 오거나 범위 표현이면 None(상대 시각은 다시 묻기)"""
+        sums = {"1시간 30분": 90, "1시간 60분": 120, "1시간 100분": 160, "1시간 120분": 180, "한 시간 120분": 180, "2시간 90분": 210}
+        for text, minutes in sums.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+                self.assertEqual(sv.parse_minutes(text), minutes)
+                self.assertEqual(got(sv.resolve_shift(f"{text} 뒤", FIXED_NOW), "minutes"), minutes)
+        for text in ("1시간 반 30분", "두세 시간"):
+            with self.subTest(text):
+                self.assertIsNone(od.parse_lead_text(text))
+                self.assertIsNone(sv.parse_minutes(text))
+                self.assertIn("ambiguous", sv.resolve_shift(f"{text} 뒤", FIXED_NOW) or {})
+        self.assertIsNone(od.parse_lead_text("47시간 120분"))       # 2940분 > 출발 여유 상한 2880분 (47시간만 읽지 않음)
+        self.assertIsNone(sv.parse_minutes("11시간 120분"))        # 780분 > 일정 소요 시간 상한 720분
+
+    def test_OD06_korean_minute_words_and_unsupported_numbers(self):
+        """OD06 (5-6 D24) 한자어 분은 A기능·일정 서비스가 같게 읽는다: 한 시간 삼십 분 90, 1시간 십오 분 75, 붙여 쓴 한시간삼십분 90.
+        '반' 뒤의 분, 시간과 떨어진 분('하고 30분', '30분 하고 1시간'), 지원하지 않는 십 단위(쉰·예순·아흔)는 일부만 읽지 않는다
+        (출발 여유·소요 시간 None, 상대 시각은 다시 묻기)"""
+        for text, minutes in {"한 시간 삼십 분": 90, "1시간 십오 분": 75, "한시간삼십분": 90}.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+                self.assertEqual(sv.parse_minutes(text), minutes)
+                self.assertEqual(got(sv.resolve_shift(f"{text} 뒤", FIXED_NOW), "minutes"), minutes)
+        for text in ("1시간 반 삼십 분", "한 시간 하고 30분", "30분 하고 1시간", "쉰두 시간", "예순두 시간", "아흔아홉 시간", "쉰 시간"):
+            with self.subTest(text):
+                self.assertIsNone(od.parse_lead_text(text))
+                self.assertIsNone(sv.parse_minutes(text))
+                self.assertIn("ambiguous", sv.resolve_shift(f"{text} 뒤", FIXED_NOW) or {})
+
+    def test_OD07_minute_rules_consistent_and_limits_kept(self):
+        """OD07 (5-6 D24) A기능도 한자어 분을 일정 서비스와 같게 읽는다(삼십 분 전 30, 오십 분 전 50). 기존 표현·D22 합산·상한은 그대로"""
+        for text, minutes in {"삼십 분 전": 30, "오십 분 전": 50}.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+                self.assertEqual(sv.parse_minutes(text.replace(" 전", "")), minutes)
+        for text, minutes in {"한 시간 반": 90, "1시간 30분": 90, "30분": 30, "1시간 120분": 180, "2시간 90분": 210}.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+                self.assertEqual(sv.parse_minutes(text), minutes)
+        self.assertIsNone(od.parse_lead_text("47시간 120분"))
+        self.assertIsNone(sv.parse_minutes("11시간 120분"))
+
+    def test_OD08_unsupported_number_words_left_after_normalization(self):
+        """OD08 (5-6 D27) 정규화한 뒤에도 숫자로 바뀌지 않은 시간·분 숫자 낱말(백·천 단위 한자어, 고유어 분, 숫자 뒤의 다른 시간)이 남으면
+        앞부분만 계산하지 않는다(출발 여유·소요 시간 None, 상대 시각은 다시 묻기). 백 단위를 새로 지원하지 않는다.
+        지원 표현(1시간 30분 90, 한 시간 삼십 분 90, 1시간 십오 분 75, 1시간 120분 180)은 그대로"""
+        for text in ("1시간 백삼십 분", "1시간 백 분", "한 시간 백이십 분", "1시간 반 백 분", "1시간 천 분", "한 시간 다섯 분", "1시간 백 시간"):
+            with self.subTest(text):
+                self.assertIsNone(od.parse_lead_text(text))
+                self.assertIsNone(sv.parse_minutes(text))
+                self.assertIn("ambiguous", sv.resolve_shift(f"{text} 뒤", FIXED_NOW) or {})
+        for text, minutes in {"1시간 30분": 90, "한 시간 삼십 분": 90, "1시간 십오 분": 75, "1시간 120분": 180, "삼십 분": 30}.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+                self.assertEqual(sv.parse_minutes(text), minutes)
+
+    def test_OD09_clock_and_conflicting_numbers_are_not_amounts(self):
+        """OD09 (5-6 D31) 출발 여유·소요 시간 칸의 시계 표현('세 시 삼십 분', '오후 3시 30분')과 서로 다른 시간 값('1시간 오 시간')은
+        일부만 읽지 않고 None. 시계 해석(parse_clock_text)과 기존 표현(1시간 30분 90, 30분 전 30, 한 시간 반 90, 다음 날 이 시간 1440)은 그대로"""
+        for text in ("세 시 삼십 분", "오후 3시 30분", "오후 3시 30분 전", "1시간 오 시간", "한 시 반 전"):
+            with self.subTest(text):
+                self.assertIsNone(od.parse_lead_text(text))
+                self.assertIsNone(sv.parse_minutes(text))
+        self.assertEqual(od.parse_clock_text("오후 3시 30분"), {"time": "15:30"})
+        for text, minutes in {"1시간 30분": 90, "30분 전": 30, "한 시간 반": 90}.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+        self.assertEqual(got(sv.resolve_shift("다음 날 이 시간", at(26, 14)), "at"), at(27, 14))
+
+    def test_OD05_supported_minute_expressions_unchanged(self):
+        """OD05 기존 표현은 그대로 (수정 전부터 통과하는 보존 테스트)"""
+        for text, minutes in {"1시간 59분": 119, "1시간 5분": 65, "120분": 120, "2시간 반": 150, "1시간 15분": 75}.items():
+            with self.subTest(text):
+                self.assertEqual(od.parse_lead_text(text), minutes)
+                self.assertEqual(sv.parse_minutes(text), minutes)
+
+
+# %% M-OD2. 5-6 D32 회귀: 새로 말한 출발 여유 시간을 읽을 수 없으면 이전 값을 다시 쓰지 않는다 (3단계 A기능 대화 흐름)
+# 핵심 요약: 수정 전에는 '한 시간 전'(60분) 뒤에 '두세 시간 전'이라고 말하면 읽지 못한 새 값 대신 이전 60분으로 출발 시각(14:00)을 계산해
+# 예보를 조회했다. 새 값을 읽으면 새 값을, 읽지 못하면 출발 시각을 비우고 출발 시각을 다시 묻는다. 새 시간 표현이 없는 후속 질문은 이전 값을 유지한다.
+class M_OD2_LeadFollowUp(unittest.TestCase):
+    FIRST = "내일 오후 3시 인천 병원 예약인데 한 시간 전에 나가"
+
+    def follow(self, second: str, second_u: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, str]]]:
+        """첫 턴(예약 15:00, 한 시간 전 출발 → 14:00) 뒤 두 번째 턴의 결과와 두 번째 턴의 예보 조회 시각"""
+        first_u = tod.u(intent="outing_consultation", intent_clear=True, needs_weather=True, city_text="인천", date_text="내일",
+                        appointment_time_text="오후 3시", departure_lead_text="한 시간 전", purpose="병원 예약")
+        with tod.Harness(llm=tod.FakeLLM({self.FIRST: first_u, second: second_u})) as h:
+            first = h.run(self.FIRST)
+            self.assertEqual((first["outing_request"]["outing_time"], first["outing_request"]["departure_lead_minutes"]), ("14:00", 60))
+            before = len(h.weather.calls)
+            second_result = h.run(second, first["conversation_state"])
+            return second_result, h.weather.times()[before:]
+
+    def test_OD10_unreadable_new_lead_does_not_reuse_previous(self):
+        """OD10 '두세 시간 전'(읽을 수 없음) → 이전 60분을 쓰지 않음: 출발 시각·여유 시간 비움, 출발 시각 질문, 14:00 예보 재조회 없음.
+        '두 시간 전'(읽음) → 새 값 120분·13:00. 시간 표현 없는 후속 질문 → 이전 60분·14:00 유지"""
+        base = {"intent": "outing_consultation", "intent_clear": True, "needs_weather": True}
+        unreadable, calls = self.follow("아니 두세 시간 전에 나갈래", tod.u(**base, departure_lead_text="두세 시간 전"))
+        req = unreadable["outing_request"]
+        self.assertEqual((req["outing_time"], req["departure_lead_minutes"]), (None, None))
+        self.assertIn("outing_time", unreadable["missing_fields"])
+        self.assertNotIn((tod.TOMORROW, "14:00"), calls)
+        readable, _ = self.follow("아니 두 시간 전에 나갈래", tod.u(**base, departure_lead_text="두 시간 전"))
+        self.assertEqual((readable["outing_request"]["outing_time"], readable["outing_request"]["departure_lead_minutes"]), ("13:00", 120))
+        kept, _ = self.follow("우산 챙겨야 해?", tod.u(**base))
+        self.assertEqual((kept["outing_request"]["outing_time"], kept["outing_request"]["departure_lead_minutes"]), ("14:00", 60))
+
+
+# %% I-AG12. 5-6 3차 검토 회귀: P1(대화), D12(자정 넘김 날짜 기준), D13(여러 추가 질문 뒤 정보 손실), 잘못된 재사용 방지
+# 핵심 요약: 날짜·상대 시각은 처음 말한 시각(KST) 기준으로 확정해 보관하고, 지역·날짜·제목·소요 시간 질문을 거쳐도
+# 이미 말한 정보를 이어 쓴다. 새로 말한 정보가 우선하고, 새 요청·부정·상담 종료 뒤에는 보관 값을 다시 쓰지 않는다. 승인 전 파일은 그대로다.
+LATE_NIGHT = datetime(2026, 11, 25, 23, 55, tzinfo=KST)
+WALK_AT_3 = "오후 세 시에 인천에서 산책할 거야."
+WALK_AT_3_U = {"operation": "create", "title": "산책", "time_text": "오후 세 시", "city_text": "인천", "category_guess": "outing"}
+
+
+class I_AG12_FollowUpKeepsDraft(AgentCase):
+
+    def add_walk(self):
+        """지역이 저장되지 않은 실외 일정 '공원 걷기' (내일 10:00~11:00, schedule_005)"""
+        made = sv.propose_create(self.doc(), title="공원 걷기", start=at(26, 10), minutes=60, now=self.now, city=None,
+                                 category="outing")
+        sv.apply_schedule_action(approved(got(made, "action")), self.schedules)
+
+    def turns(self, turns: list[tuple[str, dict[str, Any]]], *, start: datetime | None = None,
+              steps: dict[int, timedelta] | None = None, weather=None, understanding=None) -> list[dict[str, Any]]:
+        """여러 턴을 실행한다. steps={턴 번호: 흐른 시간}(그 턴 직전에 시계를 옮김). 승인 전 파일 불변을 확인한다."""
+        if start is not None:
+            self.now = start
+        self.use(ScheduleLLM(understanding=understanding or {}, schedule={text: u for text, u in turns}),
+                 weather=weather or tod.FakeWeather())
+        before, state, results = self.raw(), None, []
+        for number, (text, _) in enumerate(turns):
+            self.now = self.now + (steps or {}).get(number, timedelta())
+            result = self.agent(text, state)
+            results.append(result)
+            state = result["conversation_state"]
+        self.assertEqual(self.raw(), before)
+        return results
+
+    def start_of(self, result: dict[str, Any]) -> tuple[Any, ...]:
+        after = got(result, "proposed_action")["payload"]["after"]
+        return after["start_at"], after["end_at"], after["title"], after["city"]
+
+    def test_AG54_number_words_in_conversation(self):
+        """AG54 (P1) '지금부터 열다섯 시간 뒤' → 내일 01:00 카드(5시간 뒤 아님). 소요 '열세 시간'·'두세 시간' → 12시간 제한을 우회하지 않고 소요 시간 질문"""
+        relative = "지금부터 열다섯 시간 뒤에 인천에서 산책할 거야"
+        results = self.turns([(relative, {"operation": "create", "title": "산책", "shift_text": "지금부터 열다섯 시간 뒤",
+                                          "shift_base": "now", "city_text": "인천", "category_guess": "outing"})])
+        self.assertEqual(self.start_of(results[0])[0], ss.iso(at(26, 1)))
+        for duration in ("열세 시간", "두세 시간"):
+            with self.subTest(duration):
+                self.setUp()
+                text = f"모레 오후 세 시에 {duration} 동안 산책할 거야"
+                results = self.turns([(text, {"operation": "create", "title": "산책", "date_text": "모레", "time_text": "오후 세 시",
+                                              "duration_text": duration, "category_guess": "outing"})])
+                self.assertEqual(results[0]["missing_fields"], ["duration"])
+
+    def test_AG55_dates_do_not_move_after_midnight(self):
+        """AG55 (D12) 23:55에 말하고 00:05에 지역을 답해도 처음 말한 날짜 기준이다.
+        등록 '내일' → 11-26(두 번 모호하게 답해도 같음), 00:05에 '모레로' 정정 → 그 시각 기준 11-28,
+        변경 새 날짜 '모레' → 11-27, 변경 대상 날짜 '내일' → 11-26의 공원 걷기, 앞 대화 기준 '다음 날' → 원래 일정 다음 날(문맥 유지)"""
+        first = "내일 오후 세 시에 광주에서 산책할 거야."
+        first_u = {"operation": "create", "title": "산책", "date_text": "내일", "time_text": "오후 세 시", "city_text": "광주",
+                   "category_guess": "outing"}
+        later = {1: timedelta(minutes=10)}
+        cases = [("지역만", [(first, first_u), ("광주광역시.", answer_u("create", city_text="광주광역시"))], at(26, 15)),
+                 ("두 번 모호", [(first, first_u), ("광주", answer_u("create", city_text="광주")),
+                                ("광주광역시.", answer_u("create", city_text="광주광역시"))], at(26, 15)),
+                 ("날짜 정정", [(first, first_u), ("광주광역시, 모레로", answer_u("create", city_text="광주광역시", date_text="모레"))],
+                  at(28, 15))]
+        for name, turns, expected in cases:
+            with self.subTest(name):
+                self.setUp()
+                results = self.turns(turns, start=LATE_NIGHT, steps=later)
+                self.assertEqual(results[0]["missing_fields"], ["city"])
+                self.assertEqual(self.start_of(results[-1])[0], ss.iso(expected))
+        update = [("새 날짜", "공원 걷기 광주 기준으로 비 안 오게 모레 오후 다섯 시로 바꿔 줘",
+                   {"new_date_text": "모레", "new_time_text": "오후 다섯 시"}, LATE_NIGHT, at(27, 17)),
+                  ("대상 날짜", "내일 공원 걷기 광주 기준으로 비 안 오게 오후 다섯 시로 바꿔 줘",
+                   {"date_text": "내일", "new_time_text": "오후 다섯 시"}, LATE_NIGHT, at(26, 17)),
+                  ("문맥 표현", "공원 걷기 광주 기준으로 비 안 오게 다음 날로 옮겨 줘", {"new_date_text": "다음 날"}, None, at(27, 10))]
+        for name, text, values, start, expected in update:
+            with self.subTest(name):
+                self.setUp()
+                self.add_walk()
+                u = dict({"operation": "update", "target_text": "공원 걷기", "city_text": "광주", "preferences": ["avoid_rain"]}, **values)
+                results = self.turns([(text, u), ("광주광역시", answer_u("update", city_text="광주광역시"))], start=start, steps=later)
+                action = got(results[-1], "proposed_action")
+                self.assertEqual((action["payload"]["schedule_id"], action["payload"]["after"]["start_at"]), ("schedule_005", ss.iso(expected)))
+
+    def test_AG56_several_follow_up_questions_keep_said_values(self):
+        """AG56 (D13) 지역 → 날짜 질문, 날짜 질문만(모호하지 않은 지역), 지역 → 제목 질문, 지역 → 소요 시간 → 날짜 질문을 거쳐도
+        이미 말한 날짜·시각·소요 시간을 이어 쓴다."""
+        cases = [("지역→날짜", [("오후 세 시에 광주에서 산책할 거야.", dict(WALK_AT_3_U, city_text="광주")),
+                              ("광주광역시.", answer_u("create", city_text="광주광역시")), ("모레.", answer_u("create", date_text="모레"))],
+                  (["city"], ["date"]), (ss.iso(at(27, 15)), ss.iso(at(27, 16)), "산책", "광주광역시")),
+                 ("날짜만", [(WALK_AT_3, WALK_AT_3_U), ("모레.", answer_u("create", date_text="모레"))],
+                  (["date"],), (ss.iso(at(27, 15)), ss.iso(at(27, 16)), "산책", "인천")),
+                 ("지역→제목", [("모레 오후 세 시에 광주에서 약속 잡아 줘", {"operation": "create", "date_text": "모레", "time_text": "오후 세 시",
+                                                              "city_text": "광주"}),
+                              ("광주광역시", answer_u("create", city_text="광주광역시")), ("친구 만나기", answer_u("create", title="친구 만나기"))],
+                  (["city"], ["title"]), (ss.iso(at(27, 15)), ss.iso(at(27, 16)), "친구 만나기", "광주광역시")),
+                 ("지역→소요→날짜", [("오후 세 시에 광주에서 스무 시간 산책할 거야", dict(WALK_AT_3_U, city_text="광주", duration_text="스무 시간")),
+                                  ("광주광역시", answer_u("create", city_text="광주광역시")), ("두 시간", answer_u("create", duration_text="두 시간")),
+                                  ("모레", answer_u("create", date_text="모레"))],
+                  (["city"], ["duration"], ["date"]), (ss.iso(at(27, 15)), ss.iso(at(27, 17)), "산책", "광주광역시"))]
+        for name, turns, asked, expected in cases:
+            with self.subTest(name):
+                self.setUp()
+                results = self.turns(turns)
+                self.assertEqual([r["missing_fields"] for r in results[:-1]], list(asked), [r["answer"] for r in results])
+                self.assertEqual(self.start_of(results[-1]), expected)
+        self.assertIn("date_question_held_restored", results[-1]["llm"]["rules_applied"])
+
+    def test_AG57_held_values_not_reused_by_new_request_negation_or_end(self):
+        """AG57 날짜 질문 중 다른 이름의 새 등록 요청·부정('등록하지 마')·상담 끝내기('그만') 뒤에는 앞에서 말한 15시를 다시 쓰지 않는다.
+        날짜 질문 중 시각을 새로 말하면 그 시각이 우선한다(모레 16:00)."""
+        new_request = self.turns([(WALK_AT_3, WALK_AT_3_U),
+                                  ("내일 병원 가는 거 등록해 줘", {"operation": "create", "title": "병원", "date_text": "내일"})])
+        self.assertIsNone(new_request[-1]["proposed_action"])
+        self.assertEqual(new_request[-1]["missing_fields"], ["time"])
+        self.setUp()
+        negated = self.turns([(WALK_AT_3, WALK_AT_3_U), ("아니, 등록하지 마", {"operation": "create", "request_mode": "negated"}),
+                              ("모레 산책할 거야", {"operation": "create", "title": "산책", "date_text": "모레"})])
+        self.assertIsNone(negated[1]["conversation_state"]["draft"])
+        self.assertEqual((negated[-1]["proposed_action"], negated[-1]["missing_fields"]), (None, ["time"]))
+        self.setUp()
+        corrected = self.turns([(WALK_AT_3, WALK_AT_3_U), ("오후 네 시로 할게", answer_u("create", time_text="오후 네 시")),
+                                ("모레.", answer_u("create", date_text="모레"))])
+        self.assertEqual(corrected[1]["missing_fields"], ["date"])
+        self.assertEqual(self.start_of(corrected[-1])[0], ss.iso(at(27, 16)))
+        self.setUp()
+        script = {WALK_AT_3: WALK_AT_3_U, "모레 산책할 거야": {"operation": "create", "title": "산책", "date_text": "모레"}}
+        self.use(ScheduleLLM(understanding={text: tod.u(intent="schedule_change") for text in script}, schedule=script))
+        before = self.raw()
+        graph = self.graph()
+        self.assertEqual(self.say(graph, WALK_AT_3)["active_feature"], "S")
+        self.assertEqual(self.say(graph, "그만")["answer"], sg.S_CONSULTATION_ENDED)
+        view = self.say(graph, "모레 산책할 거야")
+        self.assertIsNone(view["pending"])
+        self.assertIn("몇 시에 시작하나요?", view["answer"])
+        self.assertEqual(self.raw(), before)
+
+    def test_AG57b_ungrounded_title_new_request_does_not_reuse_draft(self):
+        """AG57b (5-6 최종 보완, AG57 최초 입력) 날짜 질문 중 '내일 병원 가는 거 등록해 줘'에 모델이 발화에 없는 제목('병원 가기')을 내서
+        제목이 버려져도, 새 요청으로 보고 앞 초안(산책·15시·인천)을 이어 쓰지 않는다. 이름을 다시 묻고, 이름을 답해도 15시를 쓰지 않고 시각을 묻는다.
+        모델이 질문의 대답이라고 표시했거나 버려진 제목이 진행 중인 이름과 같으면 기존 다중 턴 보존을 그대로 쓴다(모레 15:00)."""
+        results = self.turns([(WALK_AT_3, WALK_AT_3_U),
+                              ("내일 병원 가는 거 등록해 줘", {"operation": "create", "title": "병원 가기", "date_text": "내일"}),
+                              ("병원", answer_u("create", title="병원"))])
+        self.assertEqual(results[1]["missing_fields"], ["title"], results[1]["answer"])
+        self.assertIsNone(results[1]["proposed_action"])
+        self.assertIn("new_create_request_replaced_draft", results[1]["llm"]["rules_applied"])
+        self.assertEqual((results[2]["proposed_action"], results[2]["missing_fields"]), (None, ["time"]))
+        for name, reply_u in (("대답 표시", answer_u("create", title="산책하기", date_text="모레")),
+                              ("같은 이름", {"operation": "create", "title": "산책", "date_text": "모레"})):
+            with self.subTest(name):
+                self.setUp()
+                results = self.turns([(WALK_AT_3, WALK_AT_3_U), ("모레로 해 줘", reply_u)])
+                self.assertEqual(self.start_of(results[-1])[:3], (ss.iso(at(27, 15)), ss.iso(at(27, 16)), "산책"))
+
+    def test_AG59_product_does_not_propose_on_unverified_or_other_city_forecast(self):
+        """AG59 (D14·D15 운영 경로, 수정 전부터 통과하는 보존 확인) 불완전 예보(강수 누락)는 '비 없음'으로 쓰지 않는다:
+        위임은 카드 없이 직접 시각을 묻고, 직접 시각(등록·변경)은 예보 확인 불가로 제안하지 않는다.
+        지역이 저장된 시장은 사용자가 '부산'을 말해도 저장 지역(인천)으로만 예보를 조회하고 인천의 비 시각(15시)을 고르지 않는다."""
+        missing = {"precipitation_mm": None, "precipitation_probability_pct": None}
+        delegate = {"operation": "update", "target_text": "시장", "delegate_choice": True, "preferences": ["avoid_rain"]}
+        cases = [("위임·전 시각 불완전", "시장 비 안 오는 시간으로 알아서 바꿔 줘", delegate, tod.FakeWeather(base=missing),
+                  "비 신호가 없다고 확인된 빈 시간을 찾지 못해"),
+                 ("직접 등록·불완전", "내일 오후 세 시에 인천에서 비 안 오면 산책 등록해 줘",
+                  {"operation": "create", "title": "산책", "date_text": "내일", "time_text": "오후 세 시", "city_text": "인천",
+                   "preferences": ["avoid_rain"], "category_guess": "outing"}, tod.FakeWeather(by_hour={15: missing}), "예보를 확인하지 못해"),
+                 ("직접 변경·불완전", "시장 비 안 오게 오후 다섯 시로 바꿔 줘",
+                  {"operation": "update", "target_text": "시장", "new_time_text": "오후 다섯 시", "preferences": ["avoid_rain"]},
+                  tod.FakeWeather(by_hour={17: missing}), "예보를 확인하지 못해")]
+        for name, text, u, weather, words in cases:
+            with self.subTest(name):
+                self.setUp()
+                results = self.turns([(text, u)], weather=weather)
+                self.assertIsNone(results[0]["proposed_action"])
+                self.assertIn(words, results[0]["answer"])
+
+        class CityWeather(tod.FakeWeather):
+            """인천 15시만 비, 다른 지역은 맑음"""
+            def __call__(self, outing_date=None, outing_time=None, city=None):
+                self.by_hour = {15: dict(RAIN)} if city == "인천" else {}
+                return super().__call__(outing_date=outing_date, outing_time=outing_time, city=city)
+        self.setUp()
+        results = self.turns([("시장 부산 기준으로 비 안 오는 시간으로 알아서 바꿔 줘", dict(delegate, city_text="부산"))],
+                             weather=CityWeather())
+        after = got(results[0], "proposed_action")["payload"]["after"]
+        self.assertEqual(after["city"], "인천")
+        start = ss.parse_iso(after["start_at"])
+        assert start is not None
+        self.assertNotEqual(start.hour, 15)
+        self.assertEqual({call["city"] for call in self.weather.calls}, {"인천"})
+
+    def test_AG58_previously_unverified_paths(self):
+        """AG58 (기존 미검증) ① 변경의 '지금부터 세 시간 뒤'는 지역을 답하는 사이 10분이 흘러도 13:00(말한 순간 기준)
+        ② 날씨 지역 질문으로 시각이 정해진 뒤 '광주' → '광주광역시, 모레로'는 상대 시각과 섞지 않고 시각을 다시 묻는다(카드 없음).
+        기존 경로 '인천, 모레로'도 같다."""
+        self.add_walk()
+        now_u = {"operation": "update", "target_text": "공원 걷기", "shift_text": "지금부터 세 시간 뒤", "shift_base": "now",
+                 "city_text": "광주", "preferences": ["avoid_rain"]}
+        results = self.turns([("공원 걷기 광주 기준으로 비 안 오게 지금부터 세 시간 뒤로 바꿔 줘", now_u),
+                              ("광주광역시", answer_u("update", city_text="광주광역시"))], steps={1: timedelta(minutes=10)})
+        self.assertEqual(self.start_of(results[-1])[0], ss.iso(at(25, 13)))
+        gate = "내일 오후 세 시에 비 안 오면 산책 등록해 줘"
+        gate_u = {"operation": "create", "title": "산책", "date_text": "내일", "time_text": "오후 세 시", "preferences": ["avoid_rain"],
+                  "category_guess": "outing"}
+        for name, replies in (("모호한 지역", [("광주", answer_u("create", city_text="광주")),
+                                           ("광주광역시, 모레로", answer_u("create", city_text="광주광역시", date_text="모레"))]),
+                              ("기존 경로", [("인천, 모레로", answer_u("create", city_text="인천", date_text="모레"))])):
+            with self.subTest(name):
+                self.setUp()
+                results = self.turns([(gate, gate_u)] + replies)
+                self.assertEqual(results[0]["missing_fields"], ["city"])
+                self.assertEqual((results[-1]["proposed_action"], results[-1]["missing_fields"]), (None, ["time"]))
+
+
+# %% I-AG13. 5-6 D21 회귀: 날씨 조건이 있는 일정은 [시작, 종료)와 겹치는 모든 정시 예보 구간을 확인한다
+# 핵심 요약: 수정 전에는 시작 시각의 1시간 구간만 조회해 14:30~15:30 일정의 15시 비를 보지 않고 제안했고, 조건부 질문은 비를 놓쳤으며,
+# 위임으로 확인한 후보가 충돌로 바뀌면 바뀐 시각의 날씨 검사를 건너뛰었다. 같은 구간은 한 턴 안에서 다시 조회하지 않고 상한 4회를 지킨다.
+SPAN_CREATE = "모레 오후 두 시 반부터 한 시간 동안 인천에서 비 안 오는 시간에 산책 등록해 줘"
+SPAN_CREATE_U = {"operation": "create", "title": "산책", "date_text": "모레", "time_text": "오후 두 시 반", "duration_text": "한 시간",
+                 "city_text": "인천", "preferences": ["avoid_rain"], "category_guess": "outing"}
+MISSING_RAIN = {"precipitation_mm": None, "precipitation_probability_pct": None}
+
+
+class I_AG13_WholeSpanForecast(AgentCase):
+
+    def run1(self, text: str, u: dict[str, Any], by_hour: dict[int, Any] | None = None, weather=None,
+             choices: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+        """한 턴 실행. 승인 전 파일 불변을 확인한다."""
+        self.use(ScheduleLLM(schedule={text: u}, choices=choices or [{"choice": "C1", "reasons": ["no_conflict"]}]),
+                 weather=weather or tod.FakeWeather(by_hour=by_hour or {}))
+        before = self.raw()
+        result = self.agent(text)
+        self.assertEqual(self.raw(), before)
+        return result
+
+    def span_of(self, result: dict[str, Any]) -> tuple[datetime, datetime]:
+        after = got(result, "proposed_action")["payload"]["after"]
+        start, end = ss.parse_iso(after["start_at"]), ss.parse_iso(after["end_at"])
+        assert start is not None and end is not None
+        return start, end
+
+    def covers_hour(self, result: dict[str, Any], hour: int) -> bool:
+        """카드 일정 [시작, 종료)가 그 시(hour)의 정시 구간과 겹치는지"""
+        start, end = self.span_of(result)
+        bucket = start.replace(hour=hour, minute=0)
+        return start < bucket + timedelta(hours=1) and bucket < end
+
+    def add_item(self, title: str, start: datetime, city: str | None = "인천"):
+        made = sv.propose_create(self.doc(), title=title, start=start, minutes=60, now=self.now, city=city, category="outing")
+        sv.apply_schedule_action(approved(got(made, "action")), self.schedules)
+
+    def test_AG60_second_hour_rain_blocks_and_both_hours_are_shown(self):
+        """AG60 모레 14:30~15:30 등록: 15시 비 → 카드 없음(비 예보 안내), 14:30·15:00 모두 조회. 맑으면 카드와 두 구간 예보 요약(no_signal)"""
+        rainy = self.run1(SPAN_CREATE, SPAN_CREATE_U, {15: dict(RAIN)})
+        self.assertIsNone(rainy["proposed_action"])
+        self.assertIn("예보가 있어 제안하지 않았어요", rainy["answer"])
+        self.assertTrue({("2026-11-27", "14:30"), ("2026-11-27", "15:00")} <= set(self.weather.times()))
+        self.setUp()
+        dry = self.run1(SPAN_CREATE, SPAN_CREATE_U)
+        self.assertEqual(self.span_of(dry), (at(27, 14, 30), at(27, 15, 30)))
+        forecast = got(dry, "proposed_action")["payload"]["forecast"]
+        self.assertEqual([(f["at"][11:16], f["status"]) for f in forecast], [("14:30", "no_signal"), ("15:00", "no_signal")])
+
+    def test_AG61_boundaries_on_the_hour_and_two_hours(self):
+        """AG61 [시작, 종료) 기준: 14:00~15:00은 14시만 확인(15시 비여도 카드, 15:00 조회 없음). 14:30~16:30은 14·15·16시 확인(16시 비 → 카드 없음)"""
+        on_hour = self.run1("모레 오후 두 시부터 한 시간 동안 인천에서 비 안 오는 시간에 산책 등록해 줘",
+                            dict(SPAN_CREATE_U, time_text="오후 두 시"), {15: dict(RAIN)})
+        self.assertEqual(self.span_of(on_hour), (at(27, 14), at(27, 15)))
+        self.assertEqual(self.weather.times(), [("2026-11-27", "14:00")])
+        self.setUp()
+        two = self.run1("모레 오후 두 시 반부터 두 시간 동안 인천에서 비 안 오는 시간에 산책 등록해 줘",
+                        dict(SPAN_CREATE_U, duration_text="두 시간"), {16: dict(RAIN)})
+        self.assertIsNone(two["proposed_action"])
+        self.assertTrue({("2026-11-27", "14:30"), ("2026-11-27", "15:00"), ("2026-11-27", "16:00")} <= set(self.weather.times()))
+
+    def test_AG62_midnight_crossing_checks_next_day_hour(self):
+        """AG62 오늘 23:30~00:30: 다음 날 0시 비 → 카드 없음. 맑으면 카드(11-25 23시·11-26 0시 구간 확인)"""
+        text = "오늘 밤 열한 시 반부터 한 시간 동안 인천에서 비 안 오는 시간에 산책 등록해 줘"
+        u = dict(SPAN_CREATE_U, date_text="오늘", time_text="밤 열한 시 반")
+        self.assertIsNone(self.run1(text, u, {0: dict(RAIN)})["proposed_action"])
+        self.setUp()
+        dry = self.run1(text, u)
+        self.assertEqual(self.span_of(dry), (at(25, 23, 30), at(26, 0, 30)))
+        self.assertEqual(self.weather.times(), [("2026-11-25", "23:30"), ("2026-11-26", "00:00")])
+
+    def test_AG63_update_direct_relative_and_delegate(self):
+        """AG63 변경: 직접 11:30(12시 비)·상대 30분 앞당김 13:30~14:30(14시 비) → 카드 없음.
+        위임(15시 비) → 15시와 겹치는 14:30·15:00 후보는 고르지 않고 13:30 카드, 같은 구간은 다시 조회하지 않아 예보 조회 3회(상한 4회 안)"""
+        for name, text, u, rain in (("직접", "시장 비 안 오게 오전 열한 시 반으로 바꿔 줘",
+                                     {"operation": "update", "target_text": "시장", "new_time_text": "오전 열한 시 반", "preferences": ["avoid_rain"]}, 12),
+                                    ("상대", "시장 비 안 오게 30분 앞당겨 줘",
+                                     {"operation": "update", "target_text": "시장", "shift_text": "30분 앞당겨", "shift_base": "schedule",
+                                      "preferences": ["avoid_rain"]}, 14)):
+            with self.subTest(name):
+                self.setUp()
+                self.assertIsNone(self.run1(text, u, {rain: dict(RAIN)})["proposed_action"])
+        self.setUp()
+        delegate = self.run1("시장 비 안 오는 시간으로 알아서 바꿔 줘",
+                             {"operation": "update", "target_text": "시장", "delegate_choice": True, "preferences": ["avoid_rain"]},
+                             {15: dict(RAIN)})
+        self.assertEqual(self.span_of(delegate), (at(26, 13, 30), at(26, 14, 30)))
+        hours = [(d, t[:2]) for d, t in self.weather.times()]
+        self.assertEqual(len(hours), len(set(hours)))
+        self.assertLessEqual(len(hours), sa.MAX_WEATHER_CALLS)
+
+    def test_AG64_conditional_checks_whole_event(self):
+        """AG64 조건부 '비가 오면 공원 걷기 시간을 바꿀까?'(모레 14:30~15:30, 15시만 비) → 조건 충족, 제안 카드는 15시와 겹치지 않음.
+        15시도 맑으면 '그대로 두셔도' 안내, 카드 없음"""
+        text = "비가 오면 공원 걷기 시간을 바꿀까?"
+        u = {"operation": "update", "target_text": "공원 걷기", "request_mode": "conditional", "preferences": ["avoid_rain"]}
+        self.add_item("공원 걷기", at(27, 14, 30))
+        met = self.run1(text, u, {15: dict(RAIN)})
+        self.assertIn("condition_met_by_forecast", met["llm"]["rules_applied"])
+        self.assertFalse(self.covers_hour(met, 15), met["answer"])
+        self.assertLessEqual(len(self.weather.calls), sa.MAX_WEATHER_CALLS)
+        self.setUp()
+        self.add_item("공원 걷기", at(27, 14, 30))
+        calm = self.run1(text, u)
+        self.assertIsNone(calm["proposed_action"])
+        self.assertIn("그대로 두셔도", calm["answer"])
+
+    def test_AG65_unverified_part_is_not_clear(self):
+        """AG65 두 번째 구간을 확인하지 못하면 날씨 조건 충족이 아니다: 15시 강수 누락, 호출 상한(mock으로 1회, 운영 값은 4회),
+        두 번째 구간이 예보 기간 밖(16일째 23:30~00:30) → 모두 카드 없음, '예보를 확인하지 못해' 안내"""
+        self.assertIn("예보를 확인하지 못해", self.run1(SPAN_CREATE, SPAN_CREATE_U, {15: dict(MISSING_RAIN)})["answer"])
+        self.assertIsNone(self.run1(SPAN_CREATE, SPAN_CREATE_U, {15: dict(MISSING_RAIN)})["proposed_action"])
+        self.setUp()
+        with mock.patch.object(sa, "MAX_WEATHER_CALLS", 1):
+            capped = self.run1(SPAN_CREATE, SPAN_CREATE_U)
+        self.assertIsNone(capped["proposed_action"])
+        self.assertIn("예보를 확인하지 못해", capped["answer"])
+        self.setUp()
+        last = FIXED_NOW.date() + timedelta(days=sa.FORECAST_DAYS - 1)
+        date_text = f"{last.month}월 {last.day}일"
+        edge = self.run1(f"{date_text} 밤 열한 시 반부터 한 시간 동안 인천에서 비 안 오는 시간에 산책 등록해 줘",
+                         dict(SPAN_CREATE_U, date_text=date_text, time_text="밤 열한 시 반"))
+        self.assertIsNone(edge["proposed_action"])
+        self.assertIn("예보를 확인하지 못해", edge["answer"])
+
+    def test_AG66_stored_city_forecast_for_whole_span(self):
+        """AG66 시장(인천)을 '부산 기준 오후 두 시 반으로' 바꾸면 예보는 저장 지역 인천으로만 조회하고,
+        인천 15시 비(다른 지역은 맑음) 때문에 14:30~15:30 카드를 만들지 않는다."""
+        class CityWeather(tod.FakeWeather):
+            def __call__(self, outing_date=None, outing_time=None, city=None):
+                self.by_hour = {15: dict(RAIN)} if city == "인천" else {}
+                return super().__call__(outing_date=outing_date, outing_time=outing_time, city=city)
+        result = self.run1("시장 부산 기준으로 비 안 오게 오후 두 시 반으로 바꿔 줘",
+                           {"operation": "update", "target_text": "시장", "new_time_text": "오후 두 시 반", "city_text": "부산",
+                            "preferences": ["avoid_rain"]}, weather=CityWeather())
+        self.assertIsNone(result["proposed_action"])
+        self.assertEqual({call["city"] for call in self.weather.calls}, {"인천"})
+
+    def test_AG67_conflict_replacement_rechecks_weather(self):
+        """AG67 (우회 차단) 위임으로 확인한 후보가 저장 직전 충돌해 17:00으로 대체되면(mock) 대체 시각의 예보를 다시 확인한다:
+        17시 비 → 카드 없음, 17시 맑음 → 17:00 카드이고 17:00 구간이 no_signal로 확인됨(unknown 아님)"""
+        real_update = sv.propose_update
+        for rain, expect_card in (({17: dict(RAIN)}, False), ({}, True)):
+            with self.subTest(rain=bool(rain)):
+                self.setUp()
+                calls = {"n": 0}
+
+                def conflict_once(doc, item, start, now, **kwargs):
+                    calls["n"] += 1
+                    if calls["n"] == 1:
+                        return {"ok": False, "code": "conflict", "message": "그 시간에는 다른 일정이 있어요.", "alternatives": [at(26, 17)]}
+                    return real_update(doc, item, start, now, **kwargs)
+                with mock.patch.object(sv, "propose_update", conflict_once):
+                    result = self.run1("시장 비 안 오는 시간으로 알아서 바꿔 줘",
+                                       {"operation": "update", "target_text": "시장", "delegate_choice": True, "preferences": ["avoid_rain"]},
+                                       rain)
+                if not expect_card:
+                    self.assertIsNone(result["proposed_action"])
+                    continue
+                self.assertEqual(self.span_of(result)[0], at(26, 17))
+                checked = {f["at"][11:16]: f["status"] for f in got(result, "proposed_action")["payload"]["forecast"]}
+                self.assertEqual(checked.get("17:00"), "no_signal")
+
+    def test_AG68_without_weather_condition_unchanged(self):
+        """AG68 (보존) 날씨 조건 없는 실외 등록 모레 14:30~15:30 → 카드, 예보 조회는 시작 시각 1회(기존과 같음)"""
+        result = self.run1("모레 오후 두 시 반부터 한 시간 동안 인천에서 산책할 거야",
+                           {"operation": "create", "title": "산책", "date_text": "모레", "time_text": "오후 두 시 반",
+                            "duration_text": "한 시간", "city_text": "인천", "category_guess": "outing"}, {15: dict(RAIN)})
+        self.assertEqual(self.span_of(result), (at(27, 14, 30), at(27, 15, 30)))
+        self.assertEqual(self.weather.times(), [("2026-11-27", "14:30")])
+        self.assertEqual([f["label"] for f in got(result, "proposed_action")["payload"]["forecast"]], ["일정 시각"])
 
 
 # %% M-AG7. 실제 LLM 테스트 판정 함수 (문제 5: 일정 id만으로 '유효한 제안'·'저장 성공'을 판정하지 않음)
@@ -2338,7 +3123,9 @@ class I_AG5_WeatherAndDelegation(AgentCase):
         result = self.agent(self.DELEGATE)
         self.assertEqual(result["proposed_action"]["payload"]["after"]["start_at"], ss.iso(at(26, 15)))
         self.assertEqual(result["decision"]["answer_source"], "llm_choice")
-        self.assertEqual(self.weather.times(), [("2026-11-26", t) for t in ("14:00", "14:30", "13:30", "15:00")])
+        # (5-6 D21) 후보마다 일정 전체 구간(14:30~15:30은 14·15시)을 확인하고, 같은 정시 구간은 한 턴 안에서 다시 조회하지 않는다.
+        # 그래서 14시(원래 14:00) → 15시(후보 14:30의 두 번째 구간) → 13시(후보 13:30) 세 번만 조회한다. (수정 전: 14:00·14:30·13:30·15:00)
+        self.assertEqual(self.weather.times(), [("2026-11-26", t) for t in ("14:00", "15:00", "13:30")])
         choice = self.s_calls("schedule_choice")[0]["context"]
         self.assertEqual([c["예보_상태"] for c in choice["후보"]], ["signal", "signal", "no_signal"])
         self.assertIn("원래 시각보다 비 예보가 적어요", result["answer"])

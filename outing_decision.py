@@ -905,20 +905,103 @@ def parse_period_text(text, *, include_soon=True):
     return found[0] if len(found) == 1 else None
 
 
+# %% (5-6 D24 보완) 한자어 분 정규화 함수
+# 핵심 요약: '삼십 분', '십오 분'처럼 분 앞의 한자어 수를 숫자로 바꾼다('한 시간 삼십 분' → '한 시간 30분').
+# 일정 서비스(schedule_service)에만 있던 규칙을 이곳으로 옮겨 출발 여유 시간과 일정 서비스가 같은 규칙을 쓴다(중복 없음).
+# 붙여 쓴 '한시간삼십분'도 읽도록 '시간' 바로 뒤('간' 다음)도 허용한다.
+SINO_DIGITS = {"일": 1, "이": 2, "삼": 3, "사": 4, "오": 5, "육": 6, "칠": 7, "팔": 8, "구": 9}
+SINO_MINUTE_RE = re.compile(r"(?:(?<=시)|(?<=간)|(?<![가-힣]))([일이삼사오육칠팔구]?십[일이삼사오육칠팔구]?|[일이삼사오육칠팔구])\s*분")
+
+
+def normalize_minute_words(text):
+    """분 앞의 한자어 수만 숫자로 바꾼 문자열 ('십오' → 15, '이십' → 20, '오' → 5)"""
+    def value(word):
+        if "십" not in word:
+            return SINO_DIGITS[word]
+        tens, _, ones = word.partition("십")
+        return (SINO_DIGITS[tens] if tens else 1) * 10 + (SINO_DIGITS[ones] if ones else 0)
+    return SINO_MINUTE_RE.sub(lambda m: f"{value(m[1])}분", text or "")
+
+
+# %% (5-6 보완) 시간 숫자 경계 검사 함수
+# 핵심 요약: 범위('두세 시간', '두 세 시간', '2~3시간')·붙은 수('스물두 시간')·소수점·너무 큰 숫자처럼 하나의 값으로 정할 수 없거나
+# 뒷부분만 잘라 읽힐 시간 숫자를 찾는다. 출발 여유 시간(parse_lead_text)과 일정 서비스(schedule_service)가 같은 규칙을 쓴다.
+# (이 파일은 일정 서비스를 import하지 않으므로 순환 import 없음)
+# (5-6 D24 보완) 지원하지 않는 십 단위(쉰·예순·일흔·여든·아흔)와 시간과 떨어진 분('한 시간 하고 30분')도 일부만 읽지 않는다.
+NATIVE_TEENS = {"열세": 13, "열네": 14, "열다섯": 15, "열여섯": 16, "열일곱": 17, "열여덟": 18, "열아홉": 19}
+_DIGIT_WORD = r"(?:[한두세네]|다섯|여섯|일곱|여덟|아홉)"
+_BIG_TENS = r"(?:스물|스무|서른|마흔|쉰|예순|일흔|여든|아흔)"
+_TENS_WORD = rf"(?:열|{_BIG_TENS})"
+_RANGE_PAIRS = r"(?:한\s*두|두\s*세|세\s*네|네\s*다섯|다섯\s*여섯|여섯\s*일곱|일곱\s*여덟|여덟\s*아홉|아홉\s*열)"
+UNREADABLE_NUMBER_RE = re.compile(
+    rf"(?<![가-힣]){_RANGE_PAIRS}\s*(?:시간|주|분)"                                     # 이웃한 두 수의 범위: 한두·두 세·세 네 시간
+    r"|(?:두어|서너|너덧|네댓|대여섯|예닐곱|일고여덟|여남은)\s*(?:시간|주|분)"            # 범위 낱말
+    rf"|(?<![가-힣])(?:{_DIGIT_WORD}|{_BIG_TENS}){_DIGIT_WORD}\s*(?:시간|주)"          # 붙은 숫자 낱말: 스물두·쉰두 시간, 세네 시간
+    rf"|(?<![가-힣]){_BIG_TENS}\s*(?:시간|주)"                                         # (D24) 지원하지 않는 십 단위 단독: 쉰 시간
+    rf"|(?<![가-힣])열{_DIGIT_WORD}\s*주"                                              # '열두 주'의 '두 주'만 읽지 않음
+    rf"|(?<![가-힣]){_TENS_WORD}\s+(?:{_DIGIT_WORD}|[0-9]+)\s*(?:시간|주)"              # 띄어 쓴 십 단위: 열 두 시간(정규화 뒤 '열 2시간')
+    rf"|(?<![가-힣])(?:[두세네]|다섯|여섯|일곱|여덟|아홉)\s*[0-9]+\s*(?:시간|주)"          # 일정 서비스 정규화 뒤의 '두 3시간'(두 세 시간)
+    r"|[0-9]+\s*[~\-–]\s*[0-9]+\s*(?:시간|분|주)|[0-9]+(?:[.,][0-9]+)+\s*(?:시간|분)"   # 숫자 범위 2~3시간, 소수점·천 단위 기호
+    r"|(?<![0-9])[0-9]{3,}\s*시간|(?<![0-9])[0-9]{4,}\s*분"                            # 세 자리 이상 시간, 네 자리 이상 분
+    r"|반\s*[0-9]+\s*분"                                                               # (D22) '1시간 반 30분'처럼 '반' 뒤에 분이 또 옴
+    # (D27) 한자어 분을 숫자로 바꾼 뒤에도 숫자 낱말이 남음: 백·천 단위 한자어('백삼십 분', '천 분', '백 시간'), 고유어 분('다섯 분')
+    # ('이 시간'처럼 한 글자 한자어는 숫자로 보지 않도록 십·백·천·만이 들어간 낱말만 본다)
+    r"|[일이삼사오육칠팔구]?[십백천만][일이삼사오육칠팔구십백천만]*\s*(?:분|시간)"
+    rf"|(?<![가-힣])(?:{_DIGIT_WORD}|{_TENS_WORD})\s*분")
+HOUR_AMOUNT_RE = re.compile(r"(?<![0-9가-힣])(?:[0-9]+|열다섯|열여섯|열일곱|열여덟|열아홉|열한|열두|열세|열네|다섯|여섯|일곱|여덟|아홉"
+                            r"|[한두세네열])\s*시간")
+MINUTE_AMOUNT_RE = re.compile(r"(?<![0-9])[0-9]+\s*분")
+# (5-6 D31 보완) 기간(출발 여유·소요 시간) 칸에 들어온 시계 표현: 오전·오후, 'N시'('시간'이 아님). 기간으로 일부만 읽지 않는다.
+# (시계 해석 parse_clock_text는 이 규칙을 쓰지 않으므로 영향 없음)
+CLOCK_WORDS_RE = re.compile(r"오전|오후|(?:[0-9]{1,2}|열한|열두|다섯|여섯|일곱|여덟|아홉|[한두세네열])\s*시(?!간)")
+
+
+def unreadable_number(text):
+    """(5-6 보완) 하나의 값으로 정할 수 없거나 뒷부분만 잘라 읽힐 시간 숫자가 있으면 True.
+    시간 값·분 값이 각각 두 번 이상 나오는 표현('두 시간에서 세 시간', '10분에서 20분')도 하나로 고르지 않는다.
+    ('예약 시간 1시간 전'처럼 숫자가 없는 '시간'은 세지 않는다)
+    (5-6 D24 보완) 한자어 분을 먼저 숫자로 바꿔 검사하고, 시간 값과 분 값이 'N시간 M분'으로 붙어 있지 않으면 하나로 정하지 않는다."""
+    # 1. 한자어 분을 숫자로 바꾼 뒤 범위·붙은 수·너무 큰 수를 찾는다.
+    t = normalize_minute_words(text or "")
+    if UNREADABLE_NUMBER_RE.search(t):
+        return True
+    # 2. 시간 값·분 값이 여러 개이거나, 하나씩인데 떨어져 있으면('한 시간 하고 30분', '30분 하고 1시간') 하나로 정하지 않는다.
+    hours, minutes = HOUR_AMOUNT_RE.findall(t), MINUTE_AMOUNT_RE.findall(t)
+    if len(hours) > 1 or len(minutes) > 1:
+        return True
+    # (D31) 시간 값이 있는데 한 글자 한자어 시간('1시간 오 시간')이 또 있으면 서로 상충하는 값이다. ('다음 날 이 시간'처럼 혼자면 숫자로 보지 않음)
+    if hours and re.search(r"(?<![가-힣0-9])[일이삼사오육칠팔구]\s*시간", t):
+        return True
+    return bool(hours and minutes) and not re.search(r"시간\s*[0-9]{1,3}\s*분", t)
+
+
 # %% 출발 여유 시간 정규화 함수
 # 핵심 요약: '두 시간 전', '1시간 반 전', '30분 전'을 분 단위 정수로 바꾼다.
-def parse_lead_text(text):
-    """정해지지 않으면 None. 0분이나 48시간 초과는 받지 않는다."""
+# (5-6 보완) '열한~열아홉 시간'을 통째로 읽고, 숫자 경계를 확인해 '열다섯'의 '다섯'·'115시간'의 '15시간'처럼 뒷부분만 읽지 않는다.
+# 하나로 정할 수 없는 표현(unreadable_number)은 None(확인 불가)으로 돌린다.
+# (5-6 D22 보완) 'N시간 M분'의 분은 세 자리까지 통째로 더한다('1시간 120분' → 180분). 뒤 자리를 버려 다른 값을 만들지 않고,
+# 합친 값이 48시간을 넘으면 일부만 읽지 않고 None이다.
+LEAD_HOURS = {**{word: n for word, n in WORD_NUMBERS.items() if word not in ("하루", "이틀", "사흘")}, **NATIVE_TEENS}
+LEAD_HOUR_RE = re.compile(r"(?<![0-9])([0-9]{1,2}|열다섯|열여섯|열일곱|열여덟|열아홉|열한|열두|열세|열네|다섯|여섯|일곱|여덟|아홉"
+                          r"|[한두세네열])\s*시간(?:\s*(반|[0-9]{1,3}\s*분))?")
 
-    # 1. 'N시간', 'N시간 반', 'N시간 M분' 형태를 읽는다.
-    t = text or ""
+
+def parse_lead_text(text):
+    """정해지지 않으면 None. 0분이나 48시간 초과는 받지 않는다. (5-6 보완) 하나로 정할 수 없는 숫자 표현도 None"""
+
+    # 1. 한자어 분을 숫자로 바꾼다(D24). 범위·붙은 숫자·너무 큰 숫자·떨어진 분·시계 표현(D31)은 일부만 읽지 않는다.
+    t = normalize_minute_words(text or "")
+    if unreadable_number(t) or CLOCK_WORDS_RE.search(t):
+        return None
+
+    # 2. 'N시간', 'N시간 반', 'N시간 M분' 형태를 읽는다. (숫자 앞 경계 확인, 열한~열아홉은 통째로)
     minutes = 0
-    if m := re.search(r"([0-9]{1,2}|다섯|여섯|일곱|여덟|아홉|[한두세네열])\s*시간(?:\s*(반|[0-9]{1,2}\s*분))?", t):
-        minutes = (int(m[1]) if m[1].isdecimal() else WORD_NUMBERS[m[1]]) * 60
+    if m := LEAD_HOUR_RE.search(t):
+        minutes = (int(m[1]) if m[1].isdecimal() else LEAD_HOURS[m[1]]) * 60
         minutes += 30 if m[2] == "반" else int(re.sub(r"\D", "", m[2] or "") or 0)
 
-    # 2. 시간 없이 'N분'만 있는 형태를 읽는다.
-    elif m := re.search(r"([0-9]{1,3})\s*분", t):
+    # 3. 시간 없이 'N분'만 있는 형태를 읽는다.
+    elif m := re.search(r"(?<![0-9])([0-9]{1,3})\s*분", t):
         minutes = int(m[1])
     return minutes if 0 < minutes <= 2880 else None
 
@@ -1033,7 +1116,12 @@ def merge_slots(state, understanding, request, now):
         elif clock:
             problems["appointment_at"] = clock["ambiguous"]
     if u["departure_lead_text"]:
-        slots["departure_lead_minutes"] = parse_lead_text(u["departure_lead_text"]) or slots["departure_lead_minutes"]
+        # (5-6 D32 보완) 새로 말한 출발 여유 시간을 읽지 못하면 이전 값을 쓰지 않는다. 출발 시각을 계산하지 않고(예보도 그 시각으로 조회 안 함)
+        # 출발 시각을 다시 묻는다(기존 '출발 시각' 질문 경로). 새 시간 표현이 없는 후속 질문은 이 블록을 지나지 않아 이전 값이 유지된다.
+        lead = parse_lead_text(u["departure_lead_text"])
+        slots["departure_lead_minutes"] = lead
+        if lead is None:
+            problems.setdefault("outing_time", "말씀하신 출발 여유 시간을 정확히 알 수 없어요. 몇 시에 출발하시는지 알려 주세요.")
     if u["alternative_time_text"]:
         clock = parse_clock_text(u["alternative_time_text"])
         if clock and "time" in clock:

@@ -25,8 +25,8 @@ from typing import Any, Callable, Iterable
 
 import schedule_store as ss
 from a_outing import KST
-from outing_decision import (CLOCK_RE, FIELDS, PERIODS, WORD_NUMBERS, forecast_signals, parse_clock_text,
-                             parse_date_text, parse_lead_text)
+from outing_decision import (CLOCK_RE, FIELDS, NATIVE_TEENS, PERIODS, WORD_NUMBERS, forecast_signals, normalize_minute_words,
+                             parse_clock_text, parse_date_text, parse_lead_text, unreadable_number)
 
 
 # %% 일정 서비스 설정값
@@ -56,23 +56,24 @@ STATE_WORDS = {"scheduled": "예정", "running": "진행 중", "overdue": "시�
 # %% 한글 숫자 표현 보강 함수
 # 핵심 요약: 3단계 시각·기간 함수가 읽지 못하는 '십오 분', '열두 시간' 같은 한글 숫자만 아라비아 숫자로 바꾼다.
 # (3단계 parse_lead_text는 '열두 시간'의 '두 시간'만 읽어 120분이 되므로, 넘기기 전에 12시간으로 바꾼다)
-SINO_DIGITS = {"일": 1, "이": 2, "삼": 3, "사": 4, "오": 5, "육": 6, "칠": 7, "팔": 8, "구": 9}
-SINO_MINUTE_RE = re.compile(r"(?:(?<=시)|(?<![가-힣]))([일이삼사오육칠팔구]?십[일이삼사오육칠팔구]?|[일이삼사오육칠팔구])\s*분")
-NATIVE_HOUR_RE = re.compile(r"(?<![가-힣])(열한|열두|다섯|여섯|일곱|여덟|아홉|[한두세네열])\s*시간")
-
-
-def _sino_value(word: str) -> int:
-    """'십오' → 15, '이십' → 20, '오' → 5"""
-    if "십" not in word:
-        return SINO_DIGITS[word]
-    tens, _, ones = word.partition("십")
-    return (SINO_DIGITS[tens] if tens else 1) * 10 + (SINO_DIGITS[ones] if ones else 0)
+# (5-6 D24 보완) 분 앞 한자어 수 규칙(SINO)은 3단계 outing_decision.normalize_minute_words로 옮겨 출발 여유 시간과 함께 쓴다.
+# (5-6 P1 보완) 13~19시간(열세~열아홉)도 통째로 읽는다. 13~19 사전과 '읽을 수 없는 숫자'(범위·붙은 수·너무 큰 수) 규칙은
+# 3단계 outing_decision에 한 번만 두고 그대로 가져다 쓴다(중복 규칙 없음, outing_decision은 이 파일을 import하지 않아 순환 없음).
+NATIVE_HOURS = {**WORD_NUMBERS, **NATIVE_TEENS}
+NATIVE_HOUR_RE = re.compile(r"(?<![가-힣])(열다섯|열여섯|열일곱|열여덟|열아홉|열한|열두|열세|열네|다섯|여섯|일곱|여덟|아홉|[한두세네열])\s*시간")
+PARTIAL_NUMBER_ASK = "말씀하신 숫자를 정확히 알 수 없어요. '13시간'처럼 숫자로 다시 알려 주세요."
 
 
 def normalize_numbers(text: str) -> str:
-    """분 앞의 한자어 수와 '시간' 앞의 고유어 수를 숫자로 바꾼 문자열"""
-    text = SINO_MINUTE_RE.sub(lambda m: f"{_sino_value(m[1])}분", text or "")
-    return NATIVE_HOUR_RE.sub(lambda m: f"{WORD_NUMBERS[m[1]]}시간", text)
+    """분 앞의 한자어 수(3단계 공통 규칙)와 '시간' 앞의 고유어 수(한~열아홉)를 숫자로 바꾼 문자열"""
+    text = normalize_minute_words(text or "")
+    return NATIVE_HOUR_RE.sub(lambda m: f"{NATIVE_HOURS[m[1]]}시간", text)
+
+
+def has_partial_number(text: str) -> bool:
+    """(5-6 P1 보완) 원문 또는 정규화한 문장에 하나로 정할 수 없거나 뒷부분만 잘라 읽힐 숫자 표현이 있는지
+    (범위 '두 세 시간'은 정규화하면 '두 3시간'이 되므로 원문도 본다. 있으면 계산하지 않고 다시 묻는다)"""
+    return unreadable_number(text or "") or unreadable_number(normalize_numbers(text))
 
 
 # %% 날짜 해석 함수
@@ -114,6 +115,9 @@ def parse_day(text: str, now: datetime, context_date: str | None = None) -> dict
         return _date_result(found, now)
 
     # 3. '일주일 뒤', '2주 후' (너무 먼 날짜는 계산하지 않고 다시 묻는다)
+    # (5-6 P1 보완) '열두 주 뒤'·'한두 주 뒤'의 '두 주'만 잘라 읽지 않고 다시 묻는다.
+    if has_partial_number(text or ""):
+        return {"ambiguous": PARTIAL_NUMBER_ASK}
     if m := re.search(r"(일주일|한주|([0-9]+|두|세|네)주)(?:일)?(?:뒤|후)", t):
         weeks = 1 if m[1] in ("일주일", "한주") else (int(m[2]) if m[2].isdecimal() else WORD_NUMBERS[m[2]])
         if weeks > MAX_AHEAD_DAYS // 7:
@@ -168,7 +172,9 @@ def parse_clock(text: str, inherit_from: str | None = None) -> dict[str, Any] | 
 
 
 def parse_minutes(text: str) -> int | None:
-    """'한 시간 반', '삼십 분', '열두 시간'을 분으로 바꾼다. 범위를 벗어나면 None"""
+    """'한 시간 반', '삼십 분', '열두 시간'을 분으로 바꾼다. 범위를 벗어나거나 읽을 수 없는 숫자(P1)면 None"""
+    if has_partial_number(text):
+        return None
     minutes = parse_lead_text(normalize_numbers(text))
     return minutes if minutes is not None and MIN_MINUTES <= minutes <= MAX_MINUTES else None
 
@@ -184,6 +190,9 @@ def resolve_shift(text: str, base: datetime) -> dict[str, Any] | None:
     """{'at': datetime, 'minutes': 이동한 분}, {'ambiguous': 이유} 또는 None(상대 시간 표현 없음)"""
     t = normalize_numbers(text or "")
     squeezed = re.sub(r"\s+", "", t)
+    # (5-6 P1 보완) '스물두 시간'·'115시간'·'열두 주'처럼 뒷부분만 읽힐 숫자는 계산하지 않고 다시 묻는다.
+    if has_partial_number(text or ""):
+        return {"ambiguous": PARTIAL_NUMBER_ASK}
 
     # 1. 날 단위: '다음 날 같은 시간', '일주일 뒤', 'N일 뒤'
     days = 0

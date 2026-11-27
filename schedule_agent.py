@@ -331,6 +331,8 @@ class Turn:
     draft: dict[str, Any] | None = None
     notices: list[str] = field(default_factory=list)
     answer_source: str = "python_template"
+    # (5-6 D21 보완) 이번 턴에 조회한 정시 구간 예보 {(지역, 정시 구간 시작): 결과}. 같은 구간을 다시 조회하지 않는다(턴이 끝나면 버림).
+    forecasts: dict[tuple[str, str], dict[str, Any]] = field(default_factory=dict)
 
     def rule(self, name: str) -> None:
         """Python이 적용한 보정·판단 규칙을 기록한다. (모델 판단과 프로그램 보정을 구분해 보고하기 위함)"""
@@ -419,6 +421,64 @@ def fetch_forecast(t: Turn, city: str | None, at: datetime) -> dict[str, Any]:
     return checked
 
 
+# %% (5-6 D21 보완) 일정 전체 시간 구간 예보 확인 함수
+# 핵심 요약: 날씨 조건이 있는 일정은 시작 시각의 1시간 구간만이 아니라 [시작, 종료)와 겹치는 모든 정시 예보 구간을 확인한다.
+# (14:00~15:00은 14시, 14:30~15:30은 14·15시, 자정을 넘기면 다음 날 0시도) 같은 지역·정시 구간은 한 턴 안에서 다시 조회하지 않고
+# 호출 상한(4회)은 그대로 둔다. 한 구간이라도 확인하지 못하면(상한·예보 기간 밖·누락·오류) 전체를 unknown으로 보고 조건 충족으로 쓰지 않는다.
+SPAN_MAX_KEYS = ("temperature_c", "apparent_temperature_c", "wind_speed_mps", "precipitation_mm", "precipitation_probability_pct")
+
+
+def span_hours(start: datetime, end: datetime) -> list[datetime]:
+    """[start, end)와 겹치는 정시 구간마다 조회할 시각. 첫 구간은 시작 시각 그대로(기존 조회와 같음), 다음 구간부터는 정시"""
+    hours = [start]
+    hour = start.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    while hour < end:
+        hours.append(hour)
+        hour += timedelta(hours=1)
+    return hours
+
+
+def fetch_span(t: Turn, city: str | None, start: datetime, end: datetime) -> dict[str, Any]:
+    """구간별 예보를 합친 결과. {"status","signals","reason","weather","at","fetched_at","parts"}
+    weather는 후보 비교·이유 검증용으로 구간별 값의 최댓값(한파 비교용 최저 기온은 coldest)이다. 표시는 parts의 원래 값을 쓴다."""
+    # 1. 구간마다 예보를 조회한다. 이번 턴에 이미 조회한 같은 지역·정시 구간은 그 결과를 다시 쓴다.
+    parts = []
+    for at in span_hours(start, end):
+        key = (str(city), ss.iso(at.replace(minute=0, second=0, microsecond=0)))
+        if key not in t.forecasts:
+            t.forecasts[key] = fetch_forecast(t, city, at)
+        parts.append(t.forecasts[key])
+    if len(parts) == 1:
+        return dict(parts[0], at=ss.iso(start), parts=parts)
+    # 2. 위험 신호는 모든 구간을 합친다. 한 구간이라도 확인하지 못했으면 전체를 unknown으로 둔다.
+    signals: dict[str, list[str]] = {}
+    for part in parts:
+        for topic, fields in part["signals"].items():
+            signals.setdefault(topic, [])
+            signals[topic] += [f for f in fields if f not in signals[topic]]
+    unknown = [part for part in parts if part["status"] == "unknown"]
+    if unknown:
+        hours = ", ".join(sv.korean_time(ss.parse_iso(part["at"]) or start) for part in unknown)
+        status, reason = "unknown", f"일정 시간 중 {hours} 구간의 예보를 확인하지 못했어요. ({unknown[0]['reason']})"
+    else:
+        status = "signal" if signals else "no_signal"
+        reason = ("일정 시간 중 프로젝트 기준의 위험 신호가 있는 구간이 있습니다." if signals
+                  else "일정 시간의 모든 구간에서 프로젝트 기준의 위험 신호가 보이지 않았습니다(안전 보장 아님).")
+    # 3. 후보 비교·이유 검증용 값: 확인한 구간의 최댓값, 한파 비교는 최저 기온(coldest)
+    known = [part["weather"] for part in parts if isinstance(part.get("weather"), dict)]
+    weather = None
+    if known:
+        weather = dict(known[0])
+        for key in SPAN_MAX_KEYS:
+            values = [w[key] for w in known if isinstance(w.get(key), (int, float))]
+            weather[key] = max(values) if values else None
+        lows = [w["temperature_c"] for w in known if isinstance(w.get("temperature_c"), (int, float))]
+        weather["coldest"] = min(lows) if lows else None
+    fetched = [part["fetched_at"] for part in parts if part.get("fetched_at")]
+    return {"status": status, "signals": signals, "reason": reason, "weather": weather, "at": ss.iso(start),
+            "fetched_at": fetched[-1] if fetched else None, "parts": parts}
+
+
 def weather_needed(u: dict[str, Any], category: Any, city: Any) -> bool:
     """실외 외출 일정이고 지역이 있을 때만 예보를 본다. 날씨와 무관한 개인 사정(늦잠 등)만 말했으면 보지 않는다. (요구 13·16)"""
     if category != "outing" or not city:
@@ -431,12 +491,14 @@ def weather_block(t: Turn, checks: list[tuple[str, dict[str, Any]]]) -> list[str
     """[확인한 예보] 줄: 3단계 weather_fact_lines()로 원자료 값을 그대로 적고, 구간별 판단과 조회 시각을 붙인다."""
     slots, notes = [], []
     for label, check in checks:
-        at = ss.parse_iso(check["at"]) or t.now
-        if check["weather"]:
-            slots.append(dict(check["weather"], fact_id=f"W{len(slots) + 1}"))
-        state = {"signal": "프로젝트 기준 위험 신호 있음(" + ", ".join(check["signals"]) + ")",
-                 "no_signal": "프로젝트 기준 위험 신호 없음(안전 보장 아님)"}.get(check["status"], "확인 못함 · " + check["reason"])
-        notes.append(f"• {label} {sv.korean_time(at)}: {state}")
+        # (5-6 D21 보완) 일정 전체 구간을 확인한 결과는 구간마다 원래 예보 값과 판단을 따로 적는다(일부 구간만으로 전체를 말하지 않음).
+        for number, part in enumerate(check.get("parts") or [check]):
+            at = ss.parse_iso(check["at"] if number == 0 else part["at"]) or t.now
+            if part["weather"]:
+                slots.append(dict(part["weather"], fact_id=f"W{len(slots) + 1}"))
+            state = {"signal": "프로젝트 기준 위험 신호 있음(" + ", ".join(part["signals"]) + ")",
+                     "no_signal": "프로젝트 기준 위험 신호 없음(안전 보장 아님)"}.get(part["status"], "확인 못함 · " + part["reason"])
+            notes.append(f"• {label if number == 0 else label + '(이어지는 구간)'} {sv.korean_time(at)}: {state}")
     if not checks:
         return []
     lines = ["[확인한 예보] (조회한 예보 값을 그대로 옮겼어요)"]
@@ -457,7 +519,9 @@ def weather_block(t: Turn, checks: list[tuple[str, dict[str, Any]]]) -> list[str
 def safety_guidance(t: Turn, check: dict[str, Any] | None) -> list[dict[str, Any]]:
     if not check or check["status"] != "signal" or not check["weather"]:
         return []
-    topics = od.choose_topics({"slots": [dict(check["weather"], fact_id="W1")]}, "outing_consultation", [])
+    # (5-6 D21 보완) 일정 전체 구간을 확인했으면 위험 신호가 있는 모든 구간의 원래 예보 값으로 주제를 고른다(두 번째 구간만의 강풍 포함).
+    found = [p["weather"] for p in check.get("parts") or [check] if p["status"] == "signal" and p["weather"]]
+    topics = od.choose_topics({"slots": [dict(w, fact_id=f"W{n}") for n, w in enumerate(found, 1)]}, "outing_consultation", [])
     try:
         od.collect_evidence(topics, t.device, t.index, t.result, t.result["usage"])
     except od.DecisionError as exc:
@@ -794,7 +858,10 @@ def reason_holds(reason: str, index: int, checks: list[dict[str, Any]], original
     if "폭염" in original["signals"]:
         return after["temperature_c"] < before["temperature_c"]
     if "한파" in original["signals"]:
-        return after["temperature_c"] > before["temperature_c"]
+        # (5-6 D21 보완) 여러 구간을 합친 예보는 최고값을 담으므로, 한파 비교는 가장 추운 구간의 기온(coldest)으로 한다.
+        cold_before = (original.get("weather") or {}).get("coldest", before["temperature_c"])
+        cold_after = (chosen.get("weather") or {}).get("coldest", after["temperature_c"])
+        return cold_before is not None and cold_after is not None and cold_after > cold_before
     return False
 
 
@@ -886,10 +953,14 @@ def choose_slot(t: Turn, draft: dict[str, Any], auto: dict[str, Any], *, minutes
         return {"none": f"실외 외출 일정으로 저장되어 있지 않아 {words} 예보로 시간을 고를 수 없어요. "
                         "일정은 바꾸지 않았어요. 원하시는 시각을 직접 말씀해 주세요.", "lines": []}
     outdoor = category == "outing" and bool(city) and (weather_needed(u, category, city) or bool(preferences))
+    # (5-6 D21 보완) 피하려는 날씨가 있으면 원래 시각과 후보 모두 일정 전체 구간([시작, 시작+소요 시간))을 확인한다.
+    # 날씨 조건 없이 맡긴 경우는 기존처럼 시작 시각 구간만 비교한다(일반 일정 동작 유지).
+    def check_at(at: datetime) -> dict[str, Any]:
+        return fetch_span(t, city, at, at + timedelta(minutes=minutes)) if preferences else fetch_forecast(t, city, at)
     original = original_check
     if outdoor and original is None and prefer is not None:
-        original = fetch_forecast(t, city, prefer)
-    checks = [fetch_forecast(t, city, s) for s in starts] if outdoor else \
+        original = check_at(prefer)
+    checks = [check_at(s) for s in starts] if outdoor else \
         [{"status": "unknown", "signals": {}, "reason": "날씨를 비교하지 않았어요.", "weather": None, "at": ss.iso(s),
           "fetched_at": None} for s in starts]
     allowed = [n for n, c in enumerate(checks) if eligible(c, preferences)]
@@ -934,15 +1005,21 @@ def choose_slot(t: Turn, draft: dict[str, Any], auto: dict[str, Any], *, minutes
 # 핵심 요약: schedule_service.propose_*()로 봉투를 만든다(action_id 1회 생성). 충돌이면 빈 시간 첫 후보로 다시 제안하고 그 사실을 알린다.
 # 제안이 만들어진 뒤에만, 실외 일정이면 바꿀 시각의 예보와 (위험 신호가 있으면) 공식 수칙을 붙인다.
 def _forecast_summary(checks: list[tuple[str, dict[str, Any]]]) -> list[dict[str, Any]]:
-    return [{"label": label, "at": c["at"], "status": c["status"], "reason": c["reason"], "fetched_at": c["fetched_at"]}
-            for label, c in checks]
+    """(5-6 D21 보완) 전체 구간을 확인한 결과는 구간마다 한 줄씩 남긴다. (첫 구간의 시각은 일정 시작 시각)"""
+    rows = []
+    for label, c in checks:
+        for number, part in enumerate(c.get("parts") or [c]):
+            rows.append({"label": label if number == 0 else f"{label}(이어지는 구간)", "at": c["at"] if number == 0 else part["at"],
+                         "status": part["status"], "reason": part["reason"], "fetched_at": part["fetched_at"]})
+    return rows
 
 
-def preference_gate(t: Turn, draft: dict[str, Any], start: datetime, city: str | None, category: Any,
+def preference_gate(t: Turn, draft: dict[str, Any], start: datetime, end: datetime, city: str | None, category: Any,
                     label: str) -> dict[str, Any]:
     """(2차 검토 보완) 사용자가 피하려는 날씨를 말했는데 시각을 직접·상대 시간·충돌 대안으로 정한 경우, 그 시각의 예보를 확인한다.
     {"checks": [(label, 예보)]}(조건 확인됨), {"ask", "awaiting"}(지역 질문) 또는 {"none": 안내}(확인 못함·조건에 맞지 않음)
-    choose_slot()과 같은 기준(eligible)을 쓴다. 확인하지 못한 예보를 '비가 안 온다'로 보지 않는다."""
+    choose_slot()과 같은 기준(eligible)을 쓴다. 확인하지 못한 예보를 '비가 안 온다'로 보지 않는다.
+    (5-6 D21 보완) 시작 시각만이 아니라 일정 전체 구간 [start, end)의 정시 예보를 모두 확인한다."""
     preferences = draft["preferences"]
     words = "·".join(PREFERENCE_WORDS[p] for p in preferences)
     when = when_text(start, t.now)
@@ -952,7 +1029,7 @@ def preference_gate(t: Turn, draft: dict[str, Any], start: datetime, city: str |
     if not city:
         draft["pending"] = {"start": ss.iso(start)}     # 지역을 받으면 같은 시각으로 다시 확인한다
         return {"ask": f"{when}의 {words} 예보를 확인하려면 지역이 필요해요. 어느 지역인지 알려 주세요.", "awaiting": "city"}
-    check = fetch_forecast(t, city, start)
+    check = fetch_span(t, city, start, end)
     lines = weather_block(t, [(label, check)])
     if check["status"] == "unknown":
         t.rule("preference_unknown_not_treated_as_clear")
@@ -1002,7 +1079,9 @@ def offer_update(t: Turn, draft: dict[str, Any], item: dict[str, Any], start: da
     # 1. 충돌: 같은 날 빈 시간 중 가장 가까운 시각으로 다시 제안한다. (보호 일정은 옮기지 않음)
     if not made["ok"] and made["code"] == "conflict" and made.get("alternatives"):
         options = made["alternatives"]
-        notice = conflict_notice(made["message"], options, weather_pending=bool(draft["preferences"]) and not verified)
+        # (5-6 D21 보완) 시각이 바뀌므로 앞에서 확인한 날씨 결과(verified)를 쓰지 않고 바뀐 시각을 다시 확인한다.
+        verified = False
+        notice = conflict_notice(made["message"], options, weather_pending=bool(draft["preferences"]))
         t.rule("conflict_alternative_offered")
         start, approximate, inherited, checks = options[0], False, False, None
         made = sv.propose_update(t.doc, item, start, t.now, reason=reason)
@@ -1016,12 +1095,13 @@ def offer_update(t: Turn, draft: dict[str, Any], item: dict[str, Any], start: da
     action = made["action"]
     city = _forecast_city(item, draft)
     if draft["preferences"] and not verified:
-        gate = preference_gate(t, draft, start, city, item["category"], "바꿀 시각")
+        # (5-6 D21 보완) 바꿀 시각은 일정 전체 구간(원래 소요 시간 그대로)을, 원래 시각도 전체 구간을 확인한다(같은 구간은 다시 조회 안 함).
+        gate = preference_gate(t, draft, start, start + (old_end - old_start), city, item["category"], "바꿀 시각")
         if "ask" in gate:
             return ask(t, draft, gate["awaiting"], "\n".join(([notice] if notice else []) + [gate["ask"]]))
         if "none" in gate:
             return ask(t, draft, "time", "\n".join(([notice] if notice else []) + [gate["none"]]))
-        checks = [("원래 시각", fetch_forecast(t, city, old_start))] + gate["checks"]
+        checks = [("원래 시각", fetch_span(t, city, old_start, old_end))] + gate["checks"]
     # 3. 실외 일정: 원래 시각과 바꿀 시각의 예보 (이미 조회했으면 다시 조회하지 않음)
     if checks is None and weather_needed(u, item["category"], item["city"]):
         checks = [("원래 시각", fetch_forecast(t, item["city"], old_start)), ("바꿀 시각", fetch_forecast(t, item["city"], start))]
@@ -1045,7 +1125,9 @@ def offer_create(t: Turn, draft: dict[str, Any], start: datetime, *, approximate
                              category=category, reason=u["reason_text"], approximate=approximate)
     if not made["ok"] and made["code"] == "conflict" and made.get("alternatives"):
         options = made["alternatives"]
-        notice = conflict_notice(made["message"], options, weather_pending=bool(draft["preferences"]) and not verified)
+        # (5-6 D21 보완) 시각이 바뀌므로 앞에서 확인한 날씨 결과(verified)를 쓰지 않고 바뀐 시각을 다시 확인한다.
+        verified = False
+        notice = conflict_notice(made["message"], options, weather_pending=bool(draft["preferences"]))
         t.rule("conflict_alternative_offered")
         start, checks = options[0], None
         made = sv.propose_create(t.doc, title=title, start=start, minutes=draft["minutes"], now=t.now, city=city,
@@ -1061,7 +1143,9 @@ def offer_create(t: Turn, draft: dict[str, Any], start: datetime, *, approximate
     action = made["action"]
     # (2차 검토 보완) '오후 두 시에 비 안 오면 등록'처럼 시각을 직접 정했어도 날씨 조건은 제안 전에 예보로 확인한다.
     if draft["preferences"] and not verified:
-        gate = preference_gate(t, draft, start, city, category, "일정 시각")
+        # (5-6 D21 보완) 등록할 일정의 전체 구간(제안 봉투의 종료 시각까지)을 확인한다.
+        end = ss.parse_iso(action["payload"]["after"]["end_at"]) or start + timedelta(minutes=sv.DEFAULT_MINUTES)
+        gate = preference_gate(t, draft, start, end, city, category, "일정 시각")
         if "ask" in gate:
             return ask(t, draft, gate["awaiting"], "\n".join(([notice] if notice else []) + [gate["ask"]]))
         if "none" in gate:
@@ -1096,22 +1180,112 @@ def _target_for(t: Turn, draft: dict[str, Any], operation: str) -> dict[str, Any
 CHANGE_WORDS = ("new_date_text", "new_time_text", "shift_text", "shift_base")
 
 
-def ambiguous_city(t: Turn, draft: dict[str, Any]) -> bool:
+def ambiguous_city(t: Turn, draft: dict[str, Any], kind: str | None = None) -> bool:
     """(검토 보완) '광주'처럼 시·도 없이는 정할 수 없는 지역은 1단계 규칙(AMBIGUOUS_CITY_NAMES)을 따라 확정하지 않고 묻는다.
+    (5-6 D1 보완) kind(create·update)를 주면 묻기 전에 이번 턴에 말한 날짜·시각·대상 표현을 초안에 보관한다.
     물었으면 True (등록·변경 공통)"""
     city = draft["city"]
     if not isinstance(city, str) or city.strip().lower() not in AMBIGUOUS_CITY_NAMES:
         return False
     options = AMBIGUOUS_CITY_NAMES[city.strip().lower()]
     draft["city"] = None
+    if kind:
+        hold_said(t, draft, kind)
     ask(t, draft, "city", f"어느 지역인지 정할 수 없어요. {options} 중 어디인지 알려 주세요.")
     return True
 
 
+# %% (5-6 D1 보완) 모호한 지역을 되묻는 동안 이번 턴의 표현 보관·복원
+# 핵심 요약: 지역을 되묻고 바로 끝내면 그 턴에 말한 날짜·시각·대상 표현이 다음 턴에 남지 않았다(D1).
+# 묻기 전에 사용자가 말한 표현(발화 근거 확인을 거친 문자열)을 초안 pending의 'hold:' 칸에 보관하고(문자열만 남기는 _clean_draft 그대로),
+# 다음 턴에 이어 쓴다. 같은 묶음(날짜·시각·대상)을 이번 턴에 새로 말했으면 새 값이 우선한다(정정 우선, 묶음 안의 표현은 서로 배타적).
+HOLD = "hold:"
+HELD_GROUPS: dict[str, dict[str, tuple[str, ...]]] = {
+    "create": {"date": ("date_text",), "time": ("time_text", "shift_text", "shift_base"),
+               "other": ("duration_text", "reason_text")},
+    "update": {"target": ("target_text", "date_text", "time_text"), "date": ("new_date_text",),
+               "time": ("new_time_text", "shift_text", "shift_base"), "other": ("reason_text",)},
+}
+TIME_SAID = {"create": ("time_text", "shift_text"), "update": ("new_time_text", "shift_text")}
+
+
+DATE_WORDS = ("date_text", "new_date_text")
+
+
+def _fixed_day(text: str, now: datetime) -> str:
+    """(5-6 D12 보완) '내일·모레·금요일'처럼 지금이 기준인 날짜 표현은 말한 순간(KST)의 달력 날짜(ISO)로 바꿔 보관한다.
+    자정을 넘겨 대답해도 날짜가 밀리지 않는다. '그날·다음 날'처럼 앞 대화가 기준이거나 정할 수 없는 표현은 그대로 둔다."""
+    parsed = sv.parse_day(text, now)
+    return parsed["date"] if parsed and "date" in parsed else text
+
+
+def hold_said(t: Turn, draft: dict[str, Any], kind: str) -> None:
+    """지역·날짜·제목·소요 시간을 되묻기 직전에 이번 턴의 표현을 보관한다.
+    '지금부터' 상대 시각은 말한 순간 기준의 절대 시각으로, 지금 기준 날짜는 말한 순간의 달력 날짜로 보관한다."""
+    u = t.u
+    # 1. 이전 보관 값은 지우고, 이번 턴(앞 턴에서 이어 쓴 값 포함)의 표현으로 다시 보관한다.
+    pending = {k: v for k, v in draft["pending"].items() if not k.startswith(HOLD)}
+    for keys in HELD_GROUPS[kind].values():
+        for key in keys:
+            value = u.get(key)
+            if isinstance(value, str) and value.strip() and value != "unknown":
+                pending[HOLD + key] = _fixed_day(value, t.now) if key in DATE_WORDS else value
+    # 2. 지금 기준 상대 시각은 지역 질문을 거치는 동안 기준이 밀리지 않게 정상 계산된 시각만 보관한다. (계산 실패·모호하면 표현 그대로)
+    base = u.get("shift_base")
+    if u.get("shift_text") and (base == "now" or (kind == "create" and base != "schedule")):
+        moved = sv.resolve_shift(u["shift_text"], t.now)
+        if moved and isinstance(moved.get("at"), datetime):
+            pending[HOLD + "start"] = ss.iso(moved["at"])
+            pending.pop(HOLD + "shift_text", None)
+            pending.pop(HOLD + "shift_base", None)
+            draft["date"] = moved["at"].date().isoformat()     # 시각만 정정하면 이 날짜를 이어 쓴다
+    # 3. 앞 턴에서 이어 받은 절대 시각이 아직 쓰이지 않았으면 다시 보관한다. (지역을 또 모호하게 답한 경우)
+    if not any(u.get(k) for k in TIME_SAID[kind]) and isinstance(pending.get("start"), str) and HOLD + "start" not in pending:
+        pending[HOLD + "start"] = pending.pop("start")
+    draft["pending"] = pending
+    draft["other_day_ok"] = draft["other_day_ok"] or bool(u.get("other_day_ok"))
+
+
+def restore_held(t: Turn, draft: dict[str, Any], kind: str) -> dict[str, Any]:
+    """지역·날짜·제목·소요 시간 질문 뒤 보관한 표현을 이어 쓴다. 이번 턴에 같은 묶음을 말했으면 보관 값을 버린다.
+    날짜만 새로 말했으면 보관한 상대 시각은 버린다(새 날짜와 상대 시각을 임의로 조합하지 않고 시각을 다시 묻게 함).
+    규칙 기록 이름은 직전에 물은 항목을 따른다(지역 질문이면 city_question_held_restored)."""
+    held = {k[len(HOLD):]: v for k, v in draft["pending"].items() if k.startswith(HOLD)}
+    if not held:
+        return t.u
+    draft["pending"] = {k: v for k, v in draft["pending"].items() if not k.startswith(HOLD)}
+    u = dict(t.u)
+    groups = HELD_GROUPS[kind]
+
+    def said(name: str) -> bool:
+        keys = TIME_SAID[kind] if name == "time" else groups[name]
+        return any(isinstance(u.get(k), str) and u[k].strip() and u[k] != "unknown" for k in keys)
+    # 1. 버릴 묶음: 이번 턴에 새로 말한 묶음, 날짜만 바꾼 경우의 상대 시각, 대상을 바꾼 경우의 이전 대상 표현
+    relative = bool(held.get("shift_text") or held.get("start"))
+    drop = {name for name in groups if name != "other" and said(name)}
+    if said("date") and relative:
+        drop.add("time")
+    if kind == "update" and u.get("exclude_previous_target"):
+        drop.add("target")
+    # 2. 남은 묶음은 이번 턴의 빈 칸에 채운다. 절대 시각은 기존 pending['start'] 이어 쓰기 경로로 옮긴다.
+    for name, keys in groups.items():
+        if name in drop:
+            continue
+        for key in keys:
+            if key in held and not (isinstance(u.get(key), str) and u[key].strip() and u[key] != "unknown"):
+                u[key] = held[key]
+    if "start" in held and "time" not in drop:
+        draft["pending"] = {**draft["pending"], "start": held["start"]}
+    t.u = u
+    t.rule(f"{draft['awaiting'] or 'follow_up'}_question_held_restored")
+    return u
+
+
 def handle_update(t: Turn) -> None:
     """일정 시각 변경 (상대 시간·직접 지정·시간대·선택 위임·날씨 조건)"""
-    u = t.u
     draft = t.draft if t.draft and t.draft["operation"] == "update" else new_draft("update")
+    # (5-6 D1 보완) 모호한 지역을 되묻느라 보관한 대상·새 시각 표현을 이어 쓴다. 이번 턴에 새로 말한 값이 우선한다.
+    u = restore_held(t, draft, "update")
     draft["preferences"] = u["preferences"] or draft["preferences"]
     draft["check_weather"] = draft["check_weather"] or u["check_weather"]
     draft["conditional"] = draft["conditional"] or u["request_mode"] == "conditional"
@@ -1119,7 +1293,7 @@ def handle_update(t: Turn) -> None:
     # (2차 검토 보완) 지역 질문에 대한 대답('인천')은 초안에 남겨 예보 조회에만 쓴다. 일정에 저장된 지역은 바꾸지 않는다.
     if u["city_text"]:
         draft["city"] = u["city_text"]
-    if ambiguous_city(t, draft):
+    if ambiguous_city(t, draft, "update"):
         return
 
     # 1. 대상 일정. 대상을 묻는 동안 사용자가 함께 말한 새 시각 표현은 초안에 보관했다가 대상이 정해지면 쓴다.
@@ -1187,15 +1361,19 @@ def handle_conditional(t: Turn, draft: dict[str, Any], item: dict[str, Any]) -> 
     if not city:
         # (2차 검토 보완) 지역이 없는 실외 일정은 조건을 확인할 지역을 묻는다. 대답한 지역은 예보 조회에만 쓴다.
         return ask(t, draft, "city", f"'{item['title']}'의 예보를 확인할 지역이 저장되어 있지 않아요. 어느 지역인지 알려 주세요.")
-    check = fetch_forecast(t, city, start)
+    # (5-6 D21 보완) 일정 전체 구간 [시작, 종료)의 정시 예보를 모두 본다. 확인한 구간 중 하나라도 그 날씨(비)가 있으면 조건 충족,
+    # 없는데 확인하지 못한 구간이 있으면 판단 불가(비가 안 온다고 보지 않음), 모두 확인했고 없으면 조건 불충족이다.
+    check = fetch_span(t, city, start, end)
+    topics = {PREFERENCE_TOPICS[p] for p in preferences}
+    met = any(topics & set(part["signals"]) for part in check["parts"] if part["status"] != "unknown")
     words = "·".join(PREFERENCE_WORDS[p] for p in preferences)
     lines = weather_block(t, [("일정 시각", check)])
     when = when_text(start, t.now)
-    if check["status"] == "unknown":
+    if check["status"] == "unknown" and not met:
         t.rule("condition_unknown_not_treated_as_clear")
         return reply(t, "\n".join([f"'{item['title']}'({when}) 시간의 예보를 확인하지 못해 {words} 예보가 있는지 판단할 수 없어요. "
                                    f"일정은 그대로 두었어요. ({check['reason']})"] + lines), "schedule_condition_unknown")
-    if not {PREFERENCE_TOPICS[p] for p in preferences} & set(check["signals"]):
+    if not met:
         t.rule("condition_not_met")
         return reply(t, "\n".join([f"'{item['title']}'({when}) 시간에는 프로젝트 기준의 {words} 신호가 보이지 않아 "
                                    "그대로 두셔도 될 것 같아요. 일정은 바꾸지 않았어요."] + lines), "schedule_condition_not_met")
@@ -1216,8 +1394,19 @@ def handle_conditional(t: Turn, draft: dict[str, Any], item: dict[str, Any]) -> 
 
 def handle_create(t: Turn) -> None:
     """새 일정 등록: 이름 → 날짜 → 시각 순서로 한 번에 하나만 묻는다. 소요 시간을 모르면 기본 60분을 제안에 표시한다."""
-    u = t.u
     draft = t.draft if t.draft and t.draft["operation"] == "create" else new_draft("create")
+    # (5-6 D13 보완) 진행 중인 등록과 이름이 다른 새 등록 요청이면(질문의 대답·정정이 아님) 앞 초안과 보관한 날짜·시각을 이어 쓰지 않는다.
+    # (5-6 최종 보완) 모델이 낸 이름이 발화에 근거가 없어 버려졌더라도(진행 중인 이름과 다르면) 새 요청일 수 있으므로 이어 쓰지 않는다.
+    # 이 경우 새 초안은 이름이 없어 이름부터 다시 묻는다(새 요청인지 확정할 수 없을 때 안전하게 질문).
+    title = t.u["title"]
+    dropped = [d.get("value") for d in t.result["llm"].get("discarded") or []
+               if isinstance(d, dict) and d.get("field") == "title" and not d.get("kept")]     # 통째로 버려진 이름만
+    continuing = t.u["answers_previous_question"] or t.u["request_mode"] == "correction"
+    if draft["title"] and not continuing and ((title and title != draft["title"]) or any(v != draft["title"] for v in dropped)):
+        draft = new_draft("create")
+        t.rule("new_create_request_replaced_draft")
+    # (5-6 D1·D13 보완) 지역·날짜·제목·소요 시간을 되묻느라 보관한 표현을 이어 쓴다. 이번 턴에 새로 말한 값이 우선한다.
+    u = restore_held(t, draft, "create")
     if u["title"]:
         draft["title"] = u["title"]
     if u["city_text"]:
@@ -1228,14 +1417,16 @@ def handle_create(t: Turn) -> None:
     # (검토 보완) 등록에서도 사용자가 말한 날씨 선호('비 안 오는 시간에')를 초안에 남겨 시간 고르기에 쓴다.
     draft["preferences"] = u["preferences"] or draft["preferences"]
     draft["check_weather"] = draft["check_weather"] or u["check_weather"]
-    if ambiguous_city(t, draft):
+    if ambiguous_city(t, draft, "create"):
         return
     if u["duration_text"]:
         minutes = sv.parse_minutes(u["duration_text"])
         if minutes is None:
+            hold_said(t, draft, "create")      # (5-6 D13 보완) 소요 시간을 다시 묻는 동안 이미 말한 날짜·시각을 보관
             return ask(t, draft, "duration", "걸리는 시간은 10분에서 12시간 사이로 알려 주세요.")
         draft["minutes"] = minutes
     if not draft["title"]:
+        hold_said(t, draft, "create")          # (5-6 D13 보완) 이름을 묻는 동안 이미 말한 날짜·시각·소요 시간을 보관
         return ask(t, draft, "title", "어떤 일정인지 이름을 알려 주세요.")
     # (2차 검토 보완) 날씨 조건을 확인할 지역을 묻느라 보관한 시각이 있으면, 새 시각을 말하지 않은 경우 그 시각으로 다시 확인한다.
     pending = draft["pending"]
@@ -1250,6 +1441,8 @@ def handle_create(t: Turn) -> None:
         t.rule("period_kept_after_follow_up_question")
     new = resolve_new_time(t, draft, None)
     if "ask" in new:
+        if new["awaiting"] == "date":
+            hold_said(t, draft, "create")      # (5-6 D13 보완) 날짜를 묻는 동안 이미 말한 시각·소요 시간을 보관
         return ask(t, draft, new["awaiting"], new["ask"], reason=new.get("reason", ""))
     if "auto" in new:
         picked = choose_slot(t, draft, new["auto"], minutes=draft["minutes"] or sv.DEFAULT_MINUTES, exclude_id=None,
