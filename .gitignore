@@ -214,6 +214,9 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# SafeMate local indexes and mock action logs
+.safemate/
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
