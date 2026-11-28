@@ -2725,6 +2725,12 @@ def classify_existing(outcome: unittest.TestResult, *, ops_changed: bool | None,
             "cause_hint": "원인 미확정" if status == FAIL else None, "problems": [text[-600:]] if text.strip() else []}
 
 
+def run_existing_test(test: unittest.TestCase, outcome: unittest.TestResult) -> None:
+    """(5-6 F4 보완) 기존 테스트 1개를 TestSuite로 실행한다. test.run()만 부르면 클래스 준비 단계(setUpClass, 예: L2_LiveFull의 색인 준비)가
+    실행되지 않아 실측 LV10c가 AttributeError로 무효가 됐다. 클래스 준비의 건너뜀·오류도 outcome에 남아 classify_existing이 그대로 분류한다."""
+    unittest.TestSuite([test]).run(outcome)
+
+
 def parse_intent_summary(printed: str) -> dict[str, int] | None:
     """L_OD_LiveIntent 출력 요약 줄에서 실행 수·모델 의도 일치·최종 경로 일치·재확인 신호를 읽는다. 못 읽으면 None(미측정)"""
     import re as _re
@@ -4430,6 +4436,50 @@ class M_LV12_TurnOrderSafety(OfflineCase):
                     self.assertEqual((result["condition_safety"], result["integrated"]), (FAIL, FAIL))
 
 
+class M_LV13_ExistingWrapperClassSetup(unittest.TestCase):
+
+    def test_LV83_existing_wrapper_runs_class_setup(self):
+        """LV83 (F4) 기존 L층 래퍼는 클래스 준비 단계(setUpClass)를 실행한다: 준비된 속성을 쓰는 테스트는 PASS,
+        클래스 준비에서 건너뛰면 NOT_RUN(Ollama 미준비 문구면 ENV_ERROR). (수정 전 방식 test.run()은 속성이 없어 오류 → FAIL)"""
+        class Prepared(unittest.TestCase):
+            index = None
+
+            @classmethod
+            def setUpClass(cls):
+                cls.index = "ready"
+
+            def test_uses_index(self):
+                self.assertEqual(type(self).index, "ready")
+                self.assertEqual(self.index, "ready")
+
+        class Skipped(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                raise unittest.SkipTest("기능 꺼짐")
+
+            def test_never(self):
+                pass
+
+        class NotReady(unittest.TestCase):
+            @classmethod
+            def setUpClass(cls):
+                raise unittest.SkipTest("Ollama 서버 또는 모델이 준비되지 않았습니다")
+
+            def test_never(self):
+                pass
+
+        def status(case: type, runner: Callable[[unittest.TestCase, unittest.TestResult], Any]) -> str:
+            case.index = None if case is Prepared else getattr(case, "index", None)
+            outcome = unittest.TestResult()
+            runner(case("test_uses_index" if case is Prepared else "test_never"), outcome)
+            return classify_existing(outcome, ops_changed=False, protected_changed=False)["existing_test"]
+
+        self.assertEqual(status(Prepared, run_existing_test), PASS)
+        self.assertEqual(status(Skipped, run_existing_test), NOT_RUN)
+        self.assertEqual(status(NotReady, run_existing_test), ENV_ERROR)
+        self.assertEqual(status(Prepared, lambda test, outcome: test.run(outcome)), FAIL)     # 수정 전 방식: 클래스 준비 없음
+
+
 class I_LV6_ExtendedConfirmFlow(OfflineCase):
 
     def test_LV76_extended_suite_answers_only_when_asked(self):
@@ -4669,7 +4719,7 @@ class L_LV10_ExistingLiveTimed(LiveCase):
                                 stack.enter_context(mock.patch.object(target, key, ctx.get(value) if value == "device" else value))
                         stack.enter_context(mock.patch.object(od, "call_ollama", recorder))
                         stack.enter_context(contextlib.redirect_stdout(output))
-                        test.run(outcome)
+                        run_existing_test(test, outcome)
                     calls = recorder.calls[before:]
                     row = classify_existing(outcome, ops_changed=operational_state() != ops_before,
                                             protected_changed=protected_records() != protected_before)
