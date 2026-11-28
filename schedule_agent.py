@@ -79,7 +79,9 @@ def new_draft(operation: str) -> dict[str, Any]:
             "target_id": None, "excluded_ids": [], "query": {"text": "", "date": None, "time": None, "period": None},
             "date": None, "time": None, "shift_text": "", "shift_base": None, "minutes": None, "title": "",
             "city": None, "category": None, "reason": "", "delegate": False, "preferences": [], "other_day_ok": False,
-            "check_weather": False, "pending": {}}
+            "check_weather": False, "pending": {},
+            # (5-6 D34·D42·D43 보완) 확인 질문 상태: 물어본 날씨 조건, 명시적으로 철회한 조건, 질문 횟수, 위임 확인을 거절했는지
+            "asked": [], "waived": [], "confirm_tries": 0, "delegate_declined": False}
 
 
 def _clean_draft(raw: Any) -> dict[str, Any] | None:
@@ -91,6 +93,10 @@ def _clean_draft(raw: Any) -> dict[str, Any] | None:
         value = raw.get(key, default)
         if key in ("candidates", "excluded_ids", "preferences"):
             draft[key] = [v for v in value if isinstance(v, str)] if isinstance(value, list) else []
+        elif key in ("asked", "waived"):
+            draft[key] = [v for v in value if v in PREFERENCES] if isinstance(value, list) else []
+        elif key == "confirm_tries":
+            draft[key] = value if type(value) is int and 0 <= value <= 9 else 0
         elif key == "query":
             query = value if isinstance(value, dict) else {}
             draft[key] = {k: query.get(k) if isinstance(query.get(k), str) else d for k, d in default.items()}
@@ -290,6 +296,12 @@ def ground_texts(understanding: dict[str, Any], message: str,
         if not kept and key == "target_text":
             # 대상은 사용자가 말한 낱말만 남긴다. 저장된 제목을 옮겨 적었어도 사용자가 말한 부분('시장')은 근거가 된다.
             kept = " ".join(word for word in sv.name_words(cleaned) if word in source)
+        if not kept and key == "shift_text" and shift_paraphrase_ok(cleaned, message, understanding["shift_base"]):
+            # (5-6 D39 보완) '늦출게'를 '한 시간 늦게'로 바꿔 옮긴 경우: 발화 자체를 계산한 값·방향과 같고 기준도 모순되지 않을 때만 인정한다.
+            kept = cleaned
+            discarded.append({"field": key, "value": value, "kept": kept, "paraphrase_verified": True})
+            grounded[key] = kept
+            continue
         if kept != value:
             grounded[key] = kept
             discarded.append({"field": key, "value": value} if not kept else {"field": key, "value": value, "kept": kept})
@@ -301,6 +313,137 @@ def ground_texts(understanding: dict[str, Any], message: str,
         discarded.append({"field": "preferences", "value": p})
     grounded["preferences"] = preferences
     return grounded, discarded
+
+
+SHIFT_CHECK_BASE = datetime(2026, 1, 5, 12, 0, tzinfo=KST)     # 값·방향 비교에만 쓰는 고정 기준 (계산 결과를 저장하지 않음)
+
+
+def shift_paraphrase_ok(value: str, message: str, base: str) -> bool:
+    """(5-6 D39 보완) 모델이 바꿔 옮긴 상대 시각이 발화와 같은 뜻인지: resolve_shift로 계산한 분 값·방향이 같고,
+    발화에 여러 시간 표현이 섞이지 않았으며(계산 불가·모호하면 불인정), 기준('지금' 유무)이 모순되지 않을 때만 True"""
+    said, model = sv.resolve_shift(message, SHIFT_CHECK_BASE), sv.resolve_shift(value, SHIFT_CHECK_BASE)
+    if not (said and model and "minutes" in said and "minutes" in model) or said["minutes"] != model["minutes"]:
+        return False
+    now_said = "지금" in message
+    return not ((base == "now" and not now_said) or (base == "schedule" and now_said))
+
+
+# %% (5-6 D34 보완) 날씨 조건 일관성 확인 함수
+# 핵심 요약: 사용자가 말한 날씨 조건(비·더위·추위·바람)을 모델이 이해 결과에서 빠뜨렸는지 원문과 비교한다. 키워드로 의도를 분류하지 않고,
+# 'LLM 출력과 원문의 불일치'만 찾는다. 빠뜨렸으면 카드를 만들지 않고 그 조건의 말로 되묻는다(조건을 임의로 채우지 않음).
+# 낱말 앞뒤 경계로 '준비·비행기·비빔밥·비밀·더 늦게·추석'의 글자에는 반응하지 않는다.
+CONDITION_WORDS = {"avoid_rain": re.compile(r"(?<![가-힣])비(?=[가는를도오와만요랑\s,.?!~]|$)|우산|강수|장마|소나기"),
+                   "avoid_heat": re.compile(r"폭염|더위|더운|덥|무더"),
+                   "avoid_cold": re.compile(r"한파|추위|추운|춥|쌀쌀|영하|(?<![가-힣])눈(?=[이은을도오와\s,.?!]|$)"),
+                   "avoid_wind": re.compile(r"바람|강풍")}
+CONDITION_ASK = {"avoid_rain": "비가 오지 않을 때", "avoid_heat": "덥지 않을 때", "avoid_cold": "춥지 않을 때",
+                 "avoid_wind": "바람이 강하지 않을 때"}
+# 확인 대답의 최소 불일치 검사용 표지 (자연어 전체를 분류하지 않음)
+AVOID_MARKS = re.compile(r"피하|피해|싫|안\s*돼|안\s*되|않았으면|말았으면|오면\s*안")
+NEGATION_START = re.compile(r"^\s*(아니|아뇨|싫어|하지\s*마)")
+# (5-6 D45·D46 보완) 철회 근거는 명시적 무관 표현만 인정한다. '와도·불어도' 같은 양보 표현만으로는 철회하지 않는다(뒤 범위의 판정을 따름).
+# '비 없이'·'비 안 오는'·'오지 않'·'~지 마'처럼 조건을 지키려는(회피·부정·금지) 표현은 철회를 막는다. '상관없이·조건 없이'의 '없이'는 제외한다.
+INDIFFERENT_MARKS = re.compile(r"상관\s*없|관계\s*없|괜찮|조건\s*(?:없이|은?\s*빼)")
+CONCESSIVE_MARKS = re.compile(r"와도|불어도|더워도|추워도|오더라도")
+WAIVER_BLOCK_MARKS = re.compile(r"안\s*(?:오|불|덥|춥|더운|추운)|지\s*않|지\s*마|지\s*말|말아|"
+                                r"(?<!상관)(?<!상관 )(?<!관계)(?<!관계 )(?<!조건)(?<!조건 )없(?:는|을|이|으면|게)")
+QUESTION_END = re.compile(r"\?|(?:까|까요|냐|니|나요|는지)\s*[.!~]*\s*$")
+WEATHER_GENERIC = re.compile(r"날씨|조건")
+LINK_ONLY = re.compile(r"[\s,·]*(?:[은는이가도]\s*)?(?:이?랑|하고|와|과|이?나|그리고)?[\s,·]*")
+# (5-6 D47 보완) 확인 질문의 yes를 인정하지 않는 명확한 불확실·부정 표지 (의미 판단은 확인 단계 LLM이 한다)
+UNCERTAIN_MARKS = re.compile(r"글쎄|모르겠|모르지|잘\s*모르|아직\s*모르|애매|생각해\s*볼|고민")
+NEGATION_ANY = re.compile(r"하지\s*마|하지\s*말|말아|그만")
+CONFIRM_KINDS = ("weather_condition", "delegate_confirm", "cancel_confirm")
+CONFIRM_LIMIT = 2              # 최초 질문 + 다시 묻기 1회 (프로젝트 설정)
+CONFIRM_ANSWER_LIMIT = 40      # 확인 질문의 대답으로 볼 발화 길이 상한 (프로젝트 설정)
+
+
+def said_conditions(message: str) -> list[str]:
+    """발화에 나온 날씨 조건 낱말의 조건 이름 목록"""
+    return [p for p in PREFERENCES if CONDITION_WORDS[p].search(message or "")]
+
+
+def explicit_waiver(text: str, conditions: list[str]) -> list[str]:
+    """명시적 철회로 확인되는 조건 목록. (5-6 D45·D46 보완) 조건 낱말 위치로 발화를 나눠 조건마다 따로 본다.
+    한 조건의 범위 = 그 낱말부터 다음 조건 낱말('날씨'·'조건' 포함) 앞까지. 범위에 회피·부정 표지가 있으면 그 조건은 철회하지 않고,
+    명시적 무관 표지('상관없어'·'괜찮아')가 있으면 철회 후보다. 양보('와도')·접속('랑')만 있는 범위는 바로 뒤 범위의 판정을 따른다.
+    질문형 발화는 철회하지 않는다. '날씨'·'조건' 범위는 자기 범위가 없는 조건에만 적용한다. 범위를 알 수 없으면 빈 목록(다시 묻기)"""
+    if not text or QUESTION_END.search(text.strip()):
+        return []
+    # 1. 조건 낱말 위치와 범위별 판정 (avoid | waive | none)
+    marks = sorted([(m.start(), m.end(), p) for p in PREFERENCES for m in CONDITION_WORDS[p].finditer(text)]
+                   + [(m.start(), m.end(), None) for m in WEATHER_GENERIC.finditer(text)], key=lambda x: x[0])
+    verdicts: list[list[Any]] = []
+    for i, (start, end, p) in enumerate(marks):
+        stop = marks[i + 1][0] if i + 1 < len(marks) else len(text)
+        span, rest = text[start:stop], text[end:stop]
+        # (5-6 D54 보완) 같은 범위에 불확실('모르겠'·'글쎄')·금지('가지 마') 표현이 있으면 무관 표지가 있어도 철회하지 않는다.
+        if AVOID_MARKS.search(span) or WAIVER_BLOCK_MARKS.search(span) or UNCERTAIN_MARKS.search(span):
+            verdict = "avoid"
+        elif INDIFFERENT_MARKS.search(span):
+            verdict = "waive"
+        else:
+            # 양보·접속 표현뿐인 범위('비 와도 ', '비랑 ')만 뒤 범위를 따른다. 근거가 없는 범위는 철회하지 않는다.
+            residue = CONCESSIVE_MARKS.sub("", rest).strip(" ,·")
+            linked = bool(LINK_ONLY.fullmatch(rest)) or (bool(CONCESSIVE_MARKS.search(rest)) and len(residue) <= 2)
+            verdict = "link" if linked else "none"
+        verdicts.append([p, verdict])
+    for i in range(len(verdicts) - 1, -1, -1):
+        if verdicts[i][1] == "link":
+            verdicts[i][1] = verdicts[i + 1][1] if i + 1 < len(verdicts) else "none"
+    # 2. 조건마다 결정: 자기 범위가 있으면 그것만, 없으면 '날씨·조건' 범위
+    generic = [v for q, v in verdicts if q is None]
+    waived = []
+    for p in conditions:
+        own = [v for q, v in verdicts if q == p] or generic
+        if "waive" in own and "avoid" not in own:
+            waived.append(p)
+    return waived
+
+
+def merge_conditions(draft: dict[str, Any], u: dict[str, Any]) -> None:
+    """(5-6 D44 보완) 초안의 확정 조건에 이번 턴의 근거 확인된 조건을 더한다(바꿔치기하지 않음). 철회는 확인 질문에서만 한다."""
+    new = set(u["preferences"])
+    draft["waived"] = sorted(set(draft["waived"]) - new)
+    draft["preferences"] = sorted((set(draft["preferences"]) | new) - set(draft["waived"]))
+
+
+def weather_question(conditions: list[str], kind: str) -> str:
+    verb = "등록" if kind == "create" else "변경"
+    names = "·".join(PREFERENCE_WORDS[p] for p in conditions)
+    asks = ", ".join(CONDITION_ASK[p] for p in conditions)
+    return (f"말씀에 날씨 이야기({names})가 있어요. {asks}만 {verb}할까요? "
+            f"날씨와 관계없이 {verb}하시려면 '날씨 상관없이'라고 말씀해 주세요.")
+
+
+# %% (5-6 D34·D42·D43 보완) 확인 질문 대답 이해 LLM 프롬프트와 출력 규격
+# 핵심 요약: Python이 물어본 확인 질문(날씨 조건·위임·취소)에 대한 대답의 뜻은 LLM이 고른다. 기존 일정 이해 프롬프트는 바꾸지 않는다.
+# Python은 answer 하나만 믿지 않고, 근거 표현이 발화에 있는지와 명확한 불일치(부정인데 yes, 회피인데 철회)만 확인한다.
+CONFIRM_ANSWERS = ("yes", "no_condition", "no", "cancel", "other")
+CONFIRM_PROMPT = """당신은 SafeMate의 '확인 대답 이해 단계'입니다. Python이 어르신께 물어본 '확인_질문'과 '사용자_대답'을 읽고
+대답의 뜻을 JSON으로만 고릅니다. 답변 문장을 쓰지 마세요.
+answer: yes(질문 내용에 동의: "네", "응", "그렇게 해 줘"), no_condition(날씨 조건을 빼 달라는 뜻: "날씨 상관없이", "~와도 괜찮아"),
+no(아니라고만 했거나 무엇을 원하는지 분명하지 않은 부정), cancel(요청 자체를 그만두라는 뜻: "등록하지 마", "그만할래"),
+other(질문과 관계없는 말이거나 판단할 수 없음)
+evidence_text: 판단 근거가 된 표현을 '사용자_대답'에서 글자 그대로 옮겨 적습니다. 없으면 ""."""
+
+
+def confirm_schema() -> dict[str, Any]:
+    """확인 대답 이해 JSON 스키마"""
+    return {"type": "object", "properties": {"answer": {"type": "string", "enum": list(CONFIRM_ANSWERS)},
+                                             "evidence_text": {"type": "string"}},
+            "required": ["answer", "evidence_text"], "additionalProperties": False}
+
+
+def validate_confirm(data: Any) -> tuple[str, str]:
+    """(answer, evidence_text). 형식이 틀리면 ValueError (호출하는 쪽이 한 번 다시 요청)"""
+    if not isinstance(data, dict) or set(data) != {"answer", "evidence_text"}:
+        raise ValueError("키가 규격과 다릅니다")
+    if data["answer"] not in CONFIRM_ANSWERS:
+        raise ValueError("answer 값이 허용 목록에 없습니다")
+    if not isinstance(data["evidence_text"], str):
+        raise ValueError("evidence_text는 문자열이어야 합니다")
+    return data["answer"], data["evidence_text"].strip()[:TEXT_LIMIT]
 
 
 # %% 결과 딕셔너리와 한 턴의 작업 묶음
@@ -589,7 +732,47 @@ def understand_schedule(t: Turn) -> dict[str, Any]:
     t.result["llm"]["understanding"] = grounded
     t.result["llm"]["model_understanding"] = understanding
     t.result["llm"]["discarded"] = discarded + [{"field": "target_ids", "value": i} for i in dropped]
+    if any(d.get("paraphrase_verified") for d in discarded):
+        t.rule("shift_paraphrase_verified")
     return grounded
+
+
+def understand_confirm(t: Turn, draft: dict[str, Any]) -> tuple[str, str]:
+    """(5-6 보완) 확인 질문에 대한 대답의 뜻 (answer, 근거 표현). 형식 오류가 두 번이면 other.
+    근거 표현이 발화에 그대로 없으면 버린다(근거 없음). 승인 정보는 만들지 않는다."""
+    context = {"확인_질문": draft["question"], "물어본_것": draft["awaiting"], "사용자_대답": t.message}
+    messages = [{"role": "system", "content": CONFIRM_PROMPT}, {"role": "user", "content": json.dumps(context, ensure_ascii=False)}]
+    for _ in (1, 2):
+        raw = od.call_llm(messages, confirm_schema(), t.settings, t.result, t.result["usage"], stage="schedule_confirm", temperature=0)
+        try:
+            answer, evidence = validate_confirm(od.parse_model_json(raw))
+            break
+        except (ValueError, TypeError) as exc:
+            messages += [{"role": "assistant", "content": raw[:2000]},
+                         {"role": "user", "content": f"형식 오류: {exc}. answer와 evidence_text만 넣어 JSON으로 다시 답하세요."}]
+    else:
+        t.rule("confirm_answer_format_invalid")
+        return "other", ""
+    if evidence and _squeeze(evidence) not in _squeeze(t.message):
+        evidence = ""
+    t.result["llm"]["confirm"] = {"answer": answer, "evidence_text": evidence}
+    return answer, evidence
+
+
+def confirm_conflict(t: Turn, answer: str, evidence: str = "", kind: str = "weather_condition") -> bool:
+    """모델 yes를 사용자 동의로 볼 수 없는지 (5-6 D47 보완): 근거 표현이 없음, 일정 이해가 negated, 발화·근거에 불확실 표현('글쎄'·'모르겠'),
+    부정('아니'로 시작, '하지 마'·'그만'). 날씨 조건 확인에서 '비 오면 하지 마'처럼 조건 낱말과 함께 쓴 부정은 조건을 지키겠다는 뜻이라 막지 않는다.
+    위임·취소 확인은 결과의 위험이 커서 회피('피하고 싶어'·'싫어')·질문형도 동의로 보지 않는다. 의미 판단 자체는 확인 단계 LLM이 한다."""
+    if answer != "yes":
+        return False
+    text = t.message
+    if not evidence or t.u["request_mode"] == "negated":
+        return True
+    if UNCERTAIN_MARKS.search(text) or UNCERTAIN_MARKS.search(evidence) or NEGATION_START.search(text):
+        return True
+    if NEGATION_ANY.search(text) and (kind != "weather_condition" or not said_conditions(text)):
+        return True
+    return kind != "weather_condition" and bool(AVOID_MARKS.search(text) or QUESTION_END.search(text.strip()))
 
 
 # %% 대상 일정 찾기 함수
@@ -648,6 +831,12 @@ def resolve_target(t: Turn, draft: dict[str, Any], operation: str) -> dict[str, 
     draft["excluded_ids"] = sorted(set(excluded))
 
     # 3. 이름·날짜·시각으로 찾는다. 새 대상을 말하지 않았으면 직전 조건을 이어 쓴다.
+    # (5-6 D38 보완) 변경 요청에서 모델이 새 시각을 '찾을 일정의 시각'(time_text)에도 똑같이 넣었고 그 표현이 발화에 한 번만 나오면
+    # 새 시각으로만 본다. (같은 표현을 두 번 말했으면 대상 시각과 새 시각을 모두 말한 것이라 대상 조건을 지우지 않음)
+    if operation == "update" and u["time_text"] and _squeeze(u["time_text"]) == _squeeze(u["new_time_text"]) \
+            and _squeeze(t.message).count(_squeeze(u["time_text"])) <= 1:
+        t.u = u = dict(u, time_text="")
+        t.rule("duplicated_time_text_used_as_new_time")
     keep = bool(draft["query"]["text"] or draft["query"]["date"]) and not u["target_text"]
     filters = _parse_target_filters(t, draft, keep)
     time_is_new = False
@@ -675,6 +864,15 @@ def resolve_target(t: Turn, draft: dict[str, Any], operation: str) -> dict[str, 
         if retry["status"] == "single":
             t.rule("time_text_used_as_new_time")
             draft["query"]["time"] = None
+            return {"item": retry["matches"][0], "time_is_new": True}
+    # 3-2. (5-6 D38 보완) 시간대('저녁')로 찾아 아무것도 없으면, 이름만으로 찾은 일정이 하나일 때만 그 시간대를 '바꿀 시각'으로 본다.
+    # (그 일정이 그 시간대 안에 있었다면 위에서 찾았으므로, 여기서 찾은 일정은 시간대 밖에 있다. 여러 개면 아래에서 묻는다)
+    if found["status"] == "none" and operation == "update" and filters["period"] and filters["text"] and not u["new_time_text"]:
+        retry = sv.find_targets(doc, now=now, operation=lookup, target_text=filters["text"], day=filters["date"],
+                                llm_ids=t.u["target_ids"], exclude_ids=draft["excluded_ids"])
+        if retry["status"] == "single":
+            t.rule("period_text_used_as_new_time")
+            draft["query"]["period"] = None
             return {"item": retry["matches"][0], "time_is_new": True}
     t.result["llm"]["target_lookup"] = {"status": found["status"], "basis": found["basis"],
                                         "llm_suggested": found["llm_suggested"]}
@@ -1055,6 +1253,13 @@ def _attach_weather(t: Turn, action: dict[str, Any], checks: list[tuple[str, dic
     return lines + guidance_lines(guidance)
 
 
+def waived_notice(draft: dict[str, Any], action: dict[str, Any]) -> None:
+    """(5-6 D34 보완) 사용자가 명시적으로 철회한 날씨 조건이 있으면 카드에 그 사실을 적는다. (승인 전 봉투라 저장 대조에 영향 없음)"""
+    if draft["waived"]:
+        words = "·".join(PREFERENCE_WORDS[p] for p in draft["waived"])
+        action["payload"]["notes"].append(f"말씀하신 대로 날씨 조건({words})을 빼고 제안해요. (예보로 그 조건을 확인하지 않았어요)")
+
+
 def conflict_notice(message: str, options: list[datetime], *, weather_pending: bool) -> str:
     """충돌 안내. (3차 검토 보완) 날씨 조건을 아직 확인하지 않은 대체 시각은 '후보'라고만 쓰고, '제안'이라는 말은 쓰지 않는다.
     날씨 조건이 없으면 바로 승인 제안이 되므로 기존 문장('~로 제안해요')을 그대로 쓴다."""
@@ -1110,6 +1315,7 @@ def offer_update(t: Turn, draft: dict[str, Any], item: dict[str, Any], start: da
         extra_lines.append(f"(예보는 말씀하신 지역 '{city}' 기준이에요. 일정에 저장된 지역은 바꾸지 않아요.)")
     draft.update(target_id=item["schedule_id"], date=start.date().isoformat(), time=f"{start:%H:%M}", pending={})
     new_when = sv.korean_time(start) if start.date() == old_start.date() else when_text(start, t.now)
+    waived_notice(draft, action)
     lines = ([notice] if notice else []) + [
         f"'{item['title']}' 일정을 {when_text(old_start, t.now)}에서 {new_when}(으)로 바꾸는 것을 제안해요. "
         f"(소요 시간 {minutes}분 그대로)", f"이유: {reason}"] + action["payload"]["notes"] + t.notices + extra_lines
@@ -1158,6 +1364,7 @@ def offer_create(t: Turn, draft: dict[str, Any], start: datetime, *, approximate
     end = ss.parse_iso(after["end_at"]) or start
     minutes = int((end - start).total_seconds() // 60)
     draft.update(date=start.date().isoformat(), time=f"{start:%H:%M}")
+    waived_notice(draft, action)
     lines = ([notice] if notice else []) + [
         f"{when_text(start, t.now)}에 '{title}'을(를) 새 일정으로 등록하는 것을 제안해요. (소요 시간 {minutes}분"
         + (f", 지역 {city}" if city else "") + ")"] + action["payload"]["notes"] + t.notices + extra_lines
@@ -1281,12 +1488,205 @@ def restore_held(t: Turn, draft: dict[str, Any], kind: str) -> dict[str, Any]:
     return u
 
 
+# %% (5-6 D34·D42·D43 보완) 확인 질문과 대답 처리 함수
+# 핵심 요약: 날씨 조건 누락·위임·취소 부정이 모호하면 카드를 만들지 않고 한 번에 하나만 묻는다(최초 + 다시 묻기 1회).
+# 대답의 뜻은 확인 단계 LLM이 고르고, Python은 근거 부족과 명확한 불일치만 막는다. 확인 긍정은 저장 승인이 아니다(저장은 승인 버튼으로만).
+def guard_conditions(t: Turn, draft: dict[str, Any], kind: str) -> bool:
+    """발화가 말한 날씨 조건 중 이해 결과·초안에 없는 조건이 있으면 그 조건으로 묻는다. 물었으면 True.
+    부정 요청(유지)과 조건이 하나도 없는 조건부 변경('어떤 날씨일 때' 질문)은 기존 경로가 막으므로 보지 않는다. check_weather는 조건이 아니다.
+    (5-6 D50 보완) 조건부 변경에서 일부 조건만 추출됐으면(발화에는 비·바람) 빠진 조건을 함께 확인할지 묻는다."""
+    if t.u["request_mode"] == "negated" or (draft["conditional"] and not draft["preferences"]):
+        return False
+    missing = [p for p in said_conditions(t.message) if p not in draft["preferences"] and p not in draft["waived"]]
+    if not missing:
+        return False
+    # 1. 처음 요청에서 이미 명시적으로 철회했으면('비 와도 상관없어') 묻지 않고 해제로 기록한다.
+    for p in explicit_waiver(t.message, missing):
+        draft["waived"] = sorted(set(draft["waived"]) | {p})
+        t.rule(f"weather_condition_withdrawn:{p}")
+    missing = [p for p in missing if p not in draft["waived"]]
+    if not missing:
+        return False
+    # 2. 카드를 만들지 않고 빠진 조건의 말로 묻는다. 이미 말한 날짜·시각·대상은 보관한다(D1·D13 방식).
+    hold_said(t, draft, kind)
+    draft.update(asked=missing, confirm_tries=1)
+    t.rule("weather_condition_unconfirmed_asked")
+    ask(t, draft, "weather_condition", condition_question(draft, missing, kind))
+    return True
+
+
+def condition_question(draft: dict[str, Any], conditions: list[str], kind: str) -> str:
+    """빠진 날씨 조건 질문. 조건부 변경('비 오면 바꿀까?')은 '그 날씨도 함께 확인할까요?'로 묻는다(D50)."""
+    if not draft["conditional"]:
+        return weather_question(conditions, kind)
+    names = "·".join(PREFERENCE_WORDS[p] for p in conditions)
+    return (f"말씀에 날씨 이야기({names})도 있어요. {names} 조건도 함께 확인할까요? "
+            "함께 확인하시려면 '응', 빼시려면 '날씨 상관없이'라고 말씀해 주세요.")
+
+
+def settle_weather(t: Turn, draft: dict[str, Any], kind: str) -> str:
+    """날씨 조건 확인 질문의 대답 처리: continue(진행) | stop(다시 물었거나 끝냄) | cancel(요청 그만두기)"""
+    asked = list(draft["asked"])
+    if not asked:
+        draft["awaiting"] = None
+        return "continue"
+    answer, evidence = understand_confirm(t, draft)
+    # 1. 대답을 해석한다. 모델이 조건을 다시 냈으면(근거 확인됨) 그 조건은 확정한다.
+    confirmed = [p for p in asked if p in t.u["preferences"]]
+    waived: list[str] = []
+    if answer == "yes" and not confirm_conflict(t, answer, evidence, "weather_condition"):
+        confirmed = asked
+    elif answer == "yes":
+        t.rule("confirm_answer_conflict")
+    elif answer == "no_condition":
+        # (5-6 D46 보완) 철회 여부는 발화 전체로 판단하고(부분 근거 '비 와도'만으로 판단하지 않음), 근거 표현은 철회할 조건의 범위만 정한다.
+        # 근거가 없으면 철회하지 않는다.
+        scope = [p for p in asked if CONDITION_WORDS[p].search(evidence)] or (list(asked) if WEATHER_GENERIC.search(evidence) else [])
+        waived = [p for p in explicit_waiver(t.message, asked) if p in scope and p not in confirmed]
+        if not waived:
+            t.rule("withdrawal_not_verified")
+    elif answer == "cancel" and t.u["request_mode"] == "negated":
+        return "cancel"
+    draft["preferences"] = sorted(set(draft["preferences"]) | set(confirmed))
+    draft["waived"] = sorted(set(draft["waived"]) | set(waived))
+    if confirmed:
+        t.rule("weather_condition_confirmed")
+    for p in waived:
+        t.rule(f"weather_condition_withdrawn:{p}")
+    remaining = [p for p in asked if p not in confirmed and p not in waived]
+    if not remaining:
+        draft.update(asked=[], confirm_tries=0, awaiting=None)
+        return "continue"
+    # 2. 확정하지 못한 조건은 다시 묻는다. 상한을 넘으면 카드 없이 끝낸다.
+    if draft["confirm_tries"] >= CONFIRM_LIMIT:
+        t.rule("weather_condition_unresolved")
+        reply(t, "날씨 조건을 확인하지 못해 제안하지 않았어요. 원하시는 조건과 함께 다시 말씀해 주세요.", "schedule_condition_unknown")
+        return "stop"
+    hold_said(t, draft, kind)
+    draft.update(asked=remaining, confirm_tries=draft["confirm_tries"] + 1)
+    lead = "날씨 조건을 빼고 진행할까요, 아니면 요청을 그만둘까요? " if answer == "no" else ""
+    ask(t, draft, "weather_condition", lead + condition_question(draft, remaining, kind))
+    return "stop"
+
+
+def settle_delegate(t: Turn, draft: dict[str, Any]) -> None:
+    """(D42) '골라 드릴까요?' 대답: 시각을 말했으면 그 시각, 충돌 없는 긍정이면 위임, 그 밖은 위임하지 않고 시각을 묻는다."""
+    u = t.u
+    if any(u[k] for k in ("new_time_text", "time_text", "shift_text", "new_date_text")) or sv.parse_clock(t.message):
+        draft["awaiting"] = "time"
+        return
+    answer, evidence = understand_confirm(t, draft)
+    if answer == "yes" and not confirm_conflict(t, answer, evidence, "delegate_confirm"):
+        draft["delegate"] = True
+        t.rule("delegation_confirmed")
+    else:
+        draft["delegate_declined"] = True
+        t.rule("delegation_not_confirmed")
+    draft["awaiting"] = None
+
+
+def delegate_question(draft: dict[str, Any]) -> str:
+    asks = ", ".join(CONDITION_ASK[p] for p in draft["preferences"])
+    return f"{asks}의 빈 시간을 제가 골라 드릴까요? 원하시는 시각이 있으면 그 시각을 말씀해 주세요."
+
+
+def wants_delegate_confirm(draft: dict[str, Any]) -> bool:
+    """날씨 조건은 확정됐는데 이 초안에서 시각을 한 번도 정하지 않았고 위임 표현도 없을 때 (위임을 확정하지 않고 먼저 묻는다).
+    앞에서 시각을 말했는데 날짜 정정 등으로 다시 물어야 하는 경우는 기존처럼 시각을 묻는다."""
+    return bool(draft["preferences"]) and not draft["time"] and not draft["delegate"] and not draft["delegate_declined"]
+
+
+def ask_cancel_confirm(t: Turn, *, weather: bool = False) -> bool:
+    """(D43) '안 갈래'가 취소 요청인지 단순 부정인지 모호하면(cancel + negated) 대상이 하나일 때 취소 여부를 묻는다. 물었으면 True
+    (5-6 D50 보완) weather=True: 날씨 낱말이 있는 취소인데 모델이 조건을 표시하지 않았을 때, 날씨와 관계없이 취소할지 묻는다."""
+    draft = new_draft("cancel")
+    target = resolve_target(t, draft, "cancel")
+    item = target.get("item")
+    if item is None or item["status"] != "scheduled" or not item["reschedulable"]:
+        return False
+    draft.update(target_id=item["schedule_id"], confirm_tries=1)
+    t.rule("cancel_weather_confirm_asked" if weather else "cancel_negation_confirm_asked")
+    lead = "말씀에 날씨 이야기가 있어요. 날씨와 관계없이 " if weather else ""
+    when = when_text(sv.interval(item)[0], t.now)
+    ask(t, draft, "cancel_confirm", f"{lead}'{item['title']}'({when}) 일정을 {'지금 ' if weather else ''}취소할까요? "
+                                    "취소하시려면 '응', 그대로 두시려면 '아니'라고 말씀해 주세요.")
+    return True
+
+
+def settle_cancel(t: Turn, draft: dict[str, Any]) -> bool:
+    """취소 확인 대답 처리. 진행하면 True(취소 제안), 아니면 답변·질문을 남기고 False"""
+    answer, evidence = understand_confirm(t, draft)
+    if answer == "yes" and not confirm_conflict(t, answer, evidence, "cancel_confirm"):
+        draft["awaiting"] = None
+        t.rule("cancel_confirmed")
+        return True
+    if answer in ("no", "cancel"):
+        reply(t, "알겠어요. 일정은 취소하지 않고 그대로 둘게요.", "schedule_kept")
+        return False
+    if draft["confirm_tries"] >= CONFIRM_LIMIT:
+        reply(t, "취소하실지 확인하지 못해 일정은 그대로 둘게요.", "schedule_kept")
+        return False
+    draft["confirm_tries"] += 1
+    ask(t, draft, "cancel_confirm", draft["question"])
+    return False
+
+
+def answer_fits(t: Turn, draft: dict[str, Any]) -> bool:
+    """(5-6 D36·D37 보완) 이번 발화가 Python이 물어본 항목의 대답으로 읽히는지 발화·이해 결과로 확인한다.
+    (answers_previous_question 하나만 믿지 않음) 확인 질문은 짧은 대답이면 확인 단계가 뜻을 판단한다."""
+    awaiting = draft["awaiting"]
+    if awaiting in CONFIRM_KINDS:
+        return "?" not in t.message and len(t.message) <= CONFIRM_ANSWER_LIMIT
+    if "?" in t.message or len(t.message) > SHORT_ANSWER_LIMIT:
+        return False
+    if awaiting == "city":
+        return bool(t.u["city_text"])
+    if awaiting == "title":
+        return bool(t.u["title"])
+    if awaiting == "duration":
+        return sv.parse_minutes(t.u["duration_text"] or t.message) is not None
+    return _short_answer_fits(t, draft)
+
+
+def new_request_signal(t: Turn, draft: dict[str, Any]) -> bool:
+    """대답 속에 새 요청이 섞였는지: 등록은 다른 이름(이름 질문의 대답·정정 제외), 변경은 다른 대상(대상 정정 제외)
+    (5-6 D49 보완) 확인 질문(날씨 조건·위임·취소)은 이름·대상을 묻지 않으므로, 그 대답에 다른 이름·대상이 있으면 정정 표기라도 새 요청이다."""
+    u = t.u
+    confirming = draft["awaiting"] in CONFIRM_KINDS
+    if u["request_mode"] == "correction" and not confirming:
+        return False
+    other = (u["target_text"] if draft["operation"] == "create" else u["title"]) if confirming else ""
+    # 실측에서 Qwen은 지역 대답('인천')을 target_text와 city_text에 함께 적었다. 지역 표현과 같은 값은 새 요청 신호가 아니다.
+    if other and _squeeze(other) != _squeeze(u["city_text"] or ""):
+        return True
+    if draft["operation"] == "create":
+        return bool(u["title"] and draft["title"] and u["title"] != draft["title"] and draft["awaiting"] != "title")
+    current = item_by_id(t.doc, draft["target_id"]) if draft["target_id"] else None
+    return bool(u["target_text"] and current is not None and not sv.text_matches(current, u["target_text"])
+                and not u["exclude_previous_target"])
+
+
 def handle_update(t: Turn) -> None:
     """일정 시각 변경 (상대 시간·직접 지정·시간대·선택 위임·날씨 조건)"""
     draft = t.draft if t.draft and t.draft["operation"] == "update" else new_draft("update")
     # (5-6 D1 보완) 모호한 지역을 되묻느라 보관한 대상·새 시각 표현을 이어 쓴다. 이번 턴에 새로 말한 값이 우선한다.
     u = restore_held(t, draft, "update")
-    draft["preferences"] = u["preferences"] or draft["preferences"]
+    # (5-6 D34·D42 보완) 날씨 조건·위임 확인 질문의 대답을 먼저 처리한다.
+    answering = draft["awaiting"] in ("weather_condition", "delegate_confirm")
+    if draft["awaiting"] == "weather_condition":
+        outcome = settle_weather(t, draft, "update")
+        if outcome == "cancel":
+            return handle_negated(t, "update")
+        if outcome == "stop":
+            return
+    elif draft["awaiting"] == "delegate_confirm":
+        settle_delegate(t, draft)
+    if answering:
+        # (5-6 D53 보완) 확인 질문의 대답 턴에서는 모델의 위임 표기(delegate_choice)를 다시 쓰지 않는다. 위임은 위임 확인 단계의
+        # 근거 있는 yes로만 확정하고, 날씨 조건 확인 대답의 위임 표기는 위임 확인 질문(D42)으로 넘긴다. 직접 말한 시각은 그대로 쓴다.
+        t.u = dict(t.u, delegate_choice=False)
+    u = t.u
+    merge_conditions(draft, u)      # (5-6 D44 보완) 새 조건은 더한다(바꿔치기하지 않음)
     draft["check_weather"] = draft["check_weather"] or u["check_weather"]
     draft["conditional"] = draft["conditional"] or u["request_mode"] == "conditional"
     draft["delegate"] = draft["delegate"] or u["delegate_choice"]
@@ -1294,6 +1694,8 @@ def handle_update(t: Turn) -> None:
     if u["city_text"]:
         draft["city"] = u["city_text"]
     if ambiguous_city(t, draft, "update"):
+        return
+    if guard_conditions(t, draft, "update"):        # (5-6 D34 보완) 말한 날씨 조건을 모델이 빠뜨렸으면 카드 전에 묻는다
         return
 
     # 1. 대상 일정. 대상을 묻는 동안 사용자가 함께 말한 새 시각 표현은 초안에 보관했다가 대상이 정해지면 쓴다.
@@ -1343,6 +1745,11 @@ def handle_update(t: Turn) -> None:
                             notice=notice, verified=picked["verified"])
     if "start" in new:
         return offer_update(t, draft, item, new["start"], approximate=new["approximate"], inherited=new["inherited"])
+    if wants_delegate_confirm(draft):
+        # (5-6 D42 보완) 날씨 조건만 있고 시각·위임 표현이 없으면 위임을 확정하지 않고 골라 드려도 되는지 먼저 묻는다.
+        t.rule("delegation_confirm_asked")
+        return ask(t, draft, "delegate_confirm", f"'{item['title']}' 일정은 지금 {when_text(start, t.now)} 예정이에요. "
+                                                 + delegate_question(draft))
     return ask(t, draft, "time", f"'{item['title']}' 일정은 지금 {when_text(start, t.now)} 예정이에요. 몇 시로 바꿀까요?")
 
 
@@ -1401,12 +1808,39 @@ def handle_create(t: Turn) -> None:
     title = t.u["title"]
     dropped = [d.get("value") for d in t.result["llm"].get("discarded") or []
                if isinstance(d, dict) and d.get("field") == "title" and not d.get("kept")]     # 통째로 버려진 이름만
-    continuing = t.u["answers_previous_question"] or t.u["request_mode"] == "correction"
-    if draft["title"] and not continuing and ((title and title != draft["title"]) or any(v != draft["title"] for v in dropped)):
+    # (5-6 D37 보완) 모델의 answers_previous_question만 믿지 않는다. 정정이거나, Python이 물어본 항목의 대답으로 확인되고
+    # (모델의 대답 표시가 있거나 버려진 다른 이름이 없음), 근거 있는 다른 이름(새 요청 신호)이 없을 때만 이어 쓴다.
+    # (실측에서 이 칸이 거의 늘 true여서 D13 보호가 풀렸음. 버려진 이름만 다르고 대답 표시도 없으면 기존 AG57b처럼 새 요청으로 본다)
+    # (5-6 D49 보완) 확인 질문은 이름을 묻지 않으므로, 버려진 다른 이름이 있으면 대답 표시가 있어도 잇지 않는다.
+    # 단, 실측에서 Qwen은 지역 대답('인천')에 '인천 방문' 같은 근거 없는 이름을 붙였다. 확인 질문 중 지역 표현을 담은 버려진 이름은
+    # 새 요청의 근거로 보지 않는다(다른 경로의 기존 규칙은 그대로).
+    confirming = draft["awaiting"] in CONFIRM_KINDS
+    city = _squeeze(t.u["city_text"] or "") if confirming else ""
+    foreign = [v for v in dropped if v != draft["title"] and not (city and city in _squeeze(str(v)))]
+    other_dropped = bool(foreign)
+    flag_ok = t.u["answers_previous_question"] and not confirming
+    verified = draft["awaiting"] is not None and answer_fits(t, draft) and (flag_ok or not other_dropped)
+    continuing = (t.u["request_mode"] == "correction" or verified) and not new_request_signal(t, draft)
+    if draft["title"] and not continuing and ((title and title != draft["title"]) or foreign):
         draft = new_draft("create")
         t.rule("new_create_request_replaced_draft")
     # (5-6 D1·D13 보완) 지역·날짜·제목·소요 시간을 되묻느라 보관한 표현을 이어 쓴다. 이번 턴에 새로 말한 값이 우선한다.
     u = restore_held(t, draft, "create")
+    # (5-6 D34·D42 보완) 날씨 조건·위임 확인 질문의 대답을 먼저 처리한다.
+    answering = draft["awaiting"] in ("weather_condition", "delegate_confirm")
+    if draft["awaiting"] == "weather_condition":
+        outcome = settle_weather(t, draft, "create")
+        if outcome == "cancel":
+            return handle_negated(t, "create")
+        if outcome == "stop":
+            return
+    elif draft["awaiting"] == "delegate_confirm":
+        settle_delegate(t, draft)
+    if answering:
+        # (5-6 D53 보완) 확인 질문의 대답 턴에서는 모델의 위임 표기(delegate_choice)를 다시 쓰지 않는다. 위임은 위임 확인 단계의
+        # 근거 있는 yes로만 확정하고, 날씨 조건 확인 대답의 위임 표기는 위임 확인 질문(D42)으로 넘긴다. 직접 말한 시각은 그대로 쓴다.
+        t.u = dict(t.u, delegate_choice=False)
+    u = t.u
     if u["title"]:
         draft["title"] = u["title"]
     if u["city_text"]:
@@ -1415,9 +1849,11 @@ def handle_create(t: Turn) -> None:
         draft["category"] = u["category_guess"]
     draft["delegate"] = draft["delegate"] or u["delegate_choice"]
     # (검토 보완) 등록에서도 사용자가 말한 날씨 선호('비 안 오는 시간에')를 초안에 남겨 시간 고르기에 쓴다.
-    draft["preferences"] = u["preferences"] or draft["preferences"]
+    merge_conditions(draft, u)      # (5-6 D44 보완) 새 조건은 더한다(바꿔치기하지 않음)
     draft["check_weather"] = draft["check_weather"] or u["check_weather"]
     if ambiguous_city(t, draft, "create"):
+        return
+    if guard_conditions(t, draft, "create"):        # (5-6 D34 보완) 말한 날씨 조건을 모델이 빠뜨렸으면 카드 전에 묻는다
         return
     if u["duration_text"]:
         minutes = sv.parse_minutes(u["duration_text"])
@@ -1456,12 +1892,19 @@ def handle_create(t: Turn) -> None:
         return offer_create(t, draft, new["start"], approximate=new["approximate"])
     if not draft["date"]:
         return ask(t, draft, "date", f"'{draft['title']}' 일정은 어느 날인가요?")
+    if wants_delegate_confirm(draft):
+        # (5-6 D42 보완) 날씨 조건만 있고 시각·위임 표현이 없으면 위임을 확정하지 않고 골라 드려도 되는지 먼저 묻는다.
+        t.rule("delegation_confirm_asked")
+        return ask(t, draft, "delegate_confirm", f"'{draft['title']}' 일정의 시각을 아직 정하지 않으셨어요. " + delegate_question(draft))
     return ask(t, draft, "time", f"'{draft['title']}'은(는) 몇 시에 시작하나요?")
 
 
 def handle_cancel_complete(t: Turn, operation: str) -> None:
     """취소(기록은 지우지 않고 cancelled) 또는 완료 기록(사용자가 끝냈다고 말한 일정만)"""
     draft = t.draft if t.draft and t.draft["operation"] == operation else new_draft(operation)
+    # (5-6 D43 보완) '취소할까요?' 확인의 대답: 충돌 없는 긍정일 때만 취소 제안으로 진행한다(제안도 승인 버튼을 거쳐야 저장).
+    if operation == "cancel" and draft["awaiting"] == "cancel_confirm" and not settle_cancel(t, draft):
+        return
     target = _target_for(t, draft, operation)
     if "ask" in target:
         return ask(t, draft, target["awaiting"], target["ask"], candidates=target["candidates"])
@@ -1653,21 +2096,54 @@ def _short_answer_fits(t: Turn, draft: dict[str, Any]) -> bool:
     return False
 
 
+UNCLEAR_SLOT_KEYS = ("date_text", "time_text", "new_date_text", "new_time_text", "shift_text", "duration_text")
+UNCLEAR_LEAD = "앞에서 여쭌 질문에 대한 대답인지 확실하지 않아 날짜·시각은 바꾸지 않았어요. "
+
+
+def conditional_unsupported(t: Turn, operation: str) -> None:
+    """조건부 등록·취소·완료 미지원 안내 (일정은 바꾸지 않음)"""
+    t.rule("conditional_operation_not_supported")
+    word = sv.OPERATION_WORDS[operation]
+    reply(t, f"날씨 조건에 따라 일정을 {word}하는 기능은 아직 없어서 일정은 바꾸지 않았어요. "
+             f"조건 없이 {word}하시려면 다시 말씀해 주시고, 날씨가 걱정되시면 '비가 오면 시간을 바꿀까?'처럼 물어봐 주세요.",
+          "schedule_condition_unsupported")
+
+
 def _dispatch(t: Turn, mode: str) -> None:
     u = t.u
     draft = t.state["draft"]
     operation, request_mode = u["operation"], u["request_mode"]
     # 1. 진행 중인 일정 상담의 대답인지 확인한다.
+    # (5-6 D36·D37 보완) answers_previous_question이나 correction 하나만으로 잇지 않는다. Python이 물어본 항목의 대답인지(answer_fits)와
+    # 새 요청 신호(다른 이름·대상)를 함께 본다. 확인할 수 있는 항목을 물었는데 맞지 않으면 대답으로 보지 않는다.
     if draft:
-        if operation == "other" and _short_answer_fits(t, draft):
+        checkable = draft["awaiting"] in ("time", "date", "target", "confirm", "city", "title", "duration") + CONFIRM_KINDS
+        confirming = draft["awaiting"] in CONFIRM_KINDS
+        if confirming and operation != draft["operation"] and answer_fits(t, draft) and not new_request_signal(t, draft) \
+                and any(u.get(k) for k in UNCLEAR_SLOT_KEYS):
+            # (5-6 D49 보완) 확인 질문 중 모델이 다른 작업·other로 표기했는데 날짜·시각 칸이 있으면, 대답인지 새 요청인지 확실하지 않다.
+            # 이전 초안에 섞거나 보관하지 않고 같은 확인 질문을 다시 묻는다. (지역만 있거나 내용 없는 대답은 아래 규칙대로 잇는다)
+            t.rule("unclear_answer_not_merged")
+            question = draft["question"].removeprefix(UNCLEAR_LEAD)
+            return ask(t, draft, draft["awaiting"], UNCLEAR_LEAD + question)
+        if operation == "other" and answer_fits(t, draft) and not (confirming and new_request_signal(t, draft)):
             operation = draft["operation"]
             t.rule("short_answer_linked_to_draft")
-        elif operation == "other" and u["answers_previous_question"] and draft["awaiting"]:
+        elif operation == "other" and u["answers_previous_question"] and draft["awaiting"] and not checkable:
             operation = draft["operation"]
             t.rule("answer_linked_to_draft")
-        elif operation not in ("other", draft["operation"]) and request_mode == "correction":
+        elif operation not in ("other", draft["operation"]) and request_mode == "correction" and not new_request_signal(t, draft):
             operation = draft["operation"]
             t.rule("correction_linked_to_draft")
+        elif operation not in ("other", draft["operation"]) and draft["awaiting"] and answer_fits(t, draft) \
+                and not new_request_signal(t, draft):
+            # 모델이 짧은 대답('인천')을 다른 작업으로 표기한 경우: 물어본 항목의 대답으로 잇고, 새 요청에만 의미 있는 표기는 쓰지 않는다.
+            operation = draft["operation"]
+            keep_mode = request_mode if request_mode in ("negated", "correction") else "request"
+            t.u = u = dict(u, request_mode=keep_mode, delegate_choice=False, other_day_ok=False, multiple_requests=False,
+                           target_ids=[], query_scope="none")
+            request_mode = keep_mode
+            t.rule("answer_linked_despite_operation_label")
         if operation == draft["operation"]:
             current = item_by_id(t.doc, draft["target_id"])
             if u["target_text"] and current is not None and not sv.text_matches(current, u["target_text"]) \
@@ -1681,24 +2157,33 @@ def _dispatch(t: Turn, mode: str) -> None:
     if u["multiple_requests"] and operation in CHANGE_OPERATIONS:
         t.notices.append("한 번에 하나씩 처리할게요. 나머지 요청은 이 일이 끝난 뒤 다시 말씀해 주세요.")
 
+    awaiting_cancel = bool(t.draft) and t.draft["awaiting"] == "cancel_confirm"
     # 2. 작업 고르기. 재확인(recheck)으로 온 경우는 일정 변경 요청일 때만 일정 답변을 쓰고, 나머지는 3단계 답변을 그대로 쓴다.
-    if request_mode == "negated" and operation != "other":
+    # (5-6 D34 보완) 날씨 조건·위임 확인 질문의 대답은 '아니'·조건부 표기라도 처리 함수에서 확인 단계로 판단한다(단순 '아니'로 요청을 버리지 않음).
+    answering = bool(t.draft) and t.draft["awaiting"] in ("weather_condition", "delegate_confirm")
+    if request_mode == "negated" and operation != "other" and not answering:
         if mode == "recheck":
             t.state["draft"] = None
             t.rule("recheck_negated_keeps_outing_answer")
             return hand_off(t)
+        # (5-6 D43 보완) 진행 중인 취소 제안이 없는데 취소 + 부정이면 '안 갈래'(취소 요청)인지 모호하므로 취소 여부를 묻는다.
+        if operation == "cancel" and not (draft and draft["operation"] == "cancel") and ask_cancel_confirm(t):
+            return
         return handle_negated(t, operation)
     if operation == "other":
         return hand_off(t)
     # (검토 보완) 날씨 조건부 판단은 시각 변경(update)에만 있다. 조건부 등록·취소·완료를 조건 없이 제안하지 않는다.
     # '비 오면 취소해 줘'를 모델이 request로 분류해도, 취소·완료에 날씨 선호가 붙어 있으면 조건부로 본다.
-    if operation in ("create", "cancel", "complete") and (
+    if not answering and operation in ("create", "cancel", "complete") and (
             request_mode == "conditional" or (operation != "create" and u["preferences"])):
-        t.rule("conditional_operation_not_supported")
-        word = sv.OPERATION_WORDS[operation]
-        return reply(t, f"날씨 조건에 따라 일정을 {word}하는 기능은 아직 없어서 일정은 바꾸지 않았어요. "
-                        f"조건 없이 {word}하시려면 다시 말씀해 주시고, 날씨가 걱정되시면 '비가 오면 시간을 바꿀까?'처럼 물어봐 주세요.",
-                     "schedule_condition_unsupported")
+        return conditional_unsupported(t, operation)
+    if not answering and not awaiting_cancel and operation == "cancel" and request_mode != "question" \
+            and said_conditions(t.message):
+        # (5-6 D50 보완) '비 오면 취소해 줘'를 모델이 조건 없는 일반 요청으로 표기한 경우: 조건(비 오면)인지 이유(비 와서)인지
+        # Python은 구분할 수 없으므로 카드 대신 날씨와 관계없이 취소할지 묻는다. 대상이 하나로 정해지지 않으면 미지원 안내(카드 없음).
+        if ask_cancel_confirm(t, weather=True):
+            return
+        return conditional_unsupported(t, operation)
     if mode == "recheck" and (operation not in CHANGE_OPERATIONS or request_mode == "question"):
         t.rule("recheck_not_schedule_change")
         return hand_off(t)

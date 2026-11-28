@@ -1541,16 +1541,30 @@ SID = {"산책": "schedule_001", "시장": "schedule_002", "복지관": "schedul
 SCHEDULE_STAGES = ("schedule_understanding", "schedule_choice")
 
 
-class ScheduleLLM(tod.FakeLLM):
-    """schedule: {발화: 일정 이해 값 | [시도별 값] | 원문}, choices: [시간 선택 답 | 함수], fail: 일정 단계에서 낼 오류"""
+CONFIRM_STAGE = "schedule_confirm"
 
-    def __init__(self, understanding=None, schedule=None, choices=None, answers=None, fail=None):
+
+class ScheduleLLM(tod.FakeLLM):
+    """schedule: {발화: 일정 이해 값 | [시도별 값] | 원문}, choices: [시간 선택 답 | 함수], fail: 일정 단계에서 낼 오류
+    (5-6 D34 보완) confirms: {확인 질문에 대한 대답: answer 문자열 | {"answer", "evidence_text"}}. 없으면 other"""
+
+    def __init__(self, understanding=None, schedule=None, choices=None, answers=None, fail=None, confirms=None):
         super().__init__(understanding=understanding, answers=answers)
         self.schedule = schedule or {}
         self.choices = list(choices or [])
         self.fail = fail
+        self.confirms = confirms or {}
 
     def __call__(self, messages, schema, settings, *, stage, max_tokens=None, temperature=None):
+        if stage == CONFIRM_STAGE:
+            context = json.loads(messages[1]["content"])
+            with self.lock:
+                self.calls.append({"stage": stage, "context": context, "schema": schema, "temperature": temperature})
+                value = self.confirms.get(context["사용자_대답"], "other")
+                item = value if isinstance(value, dict) else {"answer": value}
+                raw = json.dumps({"answer": "other", "evidence_text": "", **item}, ensure_ascii=False)
+            return raw, {"stage": stage, "model": settings["model"], "eval_count": 5, "prompt_eval_count": 10,
+                         "total_duration_ms": 5}
         if stage not in SCHEDULE_STAGES:
             return super().__call__(messages, schema, settings, stage=stage, max_tokens=max_tokens, temperature=temperature)
         context = json.loads(messages[1]["content"])
@@ -2828,6 +2842,631 @@ class I_AG13_WholeSpanForecast(AgentCase):
 
 
 # %% M-AG7. 실제 LLM 테스트 판정 함수 (문제 5: 일정 id만으로 '유효한 제안'·'저장 성공'을 판정하지 않음)
+# %% I-AG14. (5-6 D34~D44) 날씨 조건 누락 방어·확인 대답 검증·다중 턴 연결·시간 칸 보정 회귀
+# 핵심 요약: 실측(LV2·LV9)에서 실제 Qwen이 보인 출력 형태를 가상 LLM으로 만들어 넣는다(실측 문장의 원문 출력을 복사하지 않음).
+# 사용자가 말한 날씨 조건을 모델이 빠뜨리면 카드를 만들지 않고 그 조건으로 되묻는다. 확인 대답은 확인 단계 LLM이 판단하고,
+# Python은 명확한 불일치(부정인데 yes, 회피인데 철회)와 근거 부족만 막는다. 모든 사례는 승인 전 파일 바이트가 그대로다.
+WEATHER_CREATE = "내일 오후 두 시에 비 안 오면 산책 등록해 줘"
+WEATHER_CREATE_U = {"operation": "create", "title": "산책", "date_text": "내일", "time_text": "오후 두 시", "reason_text": "비 안 오면",
+                    "category_guess": "outing"}
+ANSWER_C = {"operation": "create", "answers_previous_question": True}
+ANSWER_U = {"operation": "update", "answers_previous_question": True}
+
+
+class I_AG14_WeatherConditionGuard(AgentCase):
+
+    def flow(self, steps: list[tuple[str, dict[str, Any]]], by_hour: dict[int, Any] | None = None,
+             confirms: dict[str, Any] | None = None, choices: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
+        """steps: [(발화, 일정 이해)] 차례로 실행. 턴마다 승인 전 파일 불변을 확인한다."""
+        script: dict[str, Any] = {}
+        for message, u in steps:
+            script.setdefault(message, []).append(u)
+        self.use(ScheduleLLM(schedule={m: (v if len(v) > 1 else v[0]) for m, v in script.items()}, confirms=confirms or {},
+                             choices=choices or [{"choice": "C1", "reasons": ["no_conflict"]}]),
+                 weather=tod.FakeWeather(by_hour=by_hour or {}))
+        before, state, out = self.raw(), None, []
+        for message, _ in steps:
+            result = self.agent(message, state)
+            self.assertEqual(self.raw(), before)
+            state = result["conversation_state"]
+            out.append(result)
+        return out
+
+    def start_of(self, result: dict[str, Any]) -> str:
+        return got(result, "proposed_action")["payload"]["after"]["start_at"]
+
+    def rules(self, result: dict[str, Any]) -> list[str]:
+        return result["llm"]["rules_applied"]
+
+    def test_AG69_missing_condition_blocks_card_and_asks(self):
+        """AG69 (D34) '비 안 오면 산책 등록'인데 모델이 조건을 비움 → 카드 없음, 비 조건 확인 질문, 예보 조회 0
+        (수정 전: 시장과 겹쳐 15:00 등록 카드가 예보 확인 없이 나옴 — 실측 LV2-direct-rain-1)"""
+        [first] = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U)], {15: dict(RAIN)})
+        self.assertIsNone(first["proposed_action"])
+        self.assertEqual(first["missing_fields"], ["weather_condition"])
+        self.assertIn("비가 오지 않을 때만", first["answer"])
+        self.assertIn("weather_condition_unconfirmed_asked", self.rules(first))
+        self.assertEqual(self.weather.times(), [])
+
+    def test_AG70_yes_keeps_condition_then_forecast_decides(self):
+        """AG70 '응'(yes) → 조건 유지 → 15:00 대체 후보 + 지역 질문 → '인천' → 15시 비: 카드 없음 / 맑음: 15:00 카드(15시 조회)"""
+        steps = [(WEATHER_CREATE, WEATHER_CREATE_U), ("응", ANSWER_C), ("인천", dict(ANSWER_C, city_text="인천"))]
+        rainy = self.flow(steps, {15: dict(RAIN)}, confirms={"응": {"answer": "yes", "evidence_text": "응"}})
+        self.assertEqual(rainy[1]["missing_fields"], ["city"])
+        self.assertIn("weather_condition_confirmed", self.rules(rainy[1]))
+        self.assertIsNone(rainy[2]["proposed_action"])
+        self.assertIn("비 예보가 있어 제안하지 않았어요", rainy[2]["answer"])
+        self.setUp()
+        dry = self.flow(steps, confirms={"응": {"answer": "yes", "evidence_text": "응"}})
+        self.assertEqual(self.start_of(dry[2]), ss.iso(at(26, 15)))
+        self.assertIn(("2026-11-26", "15:00"), self.weather.times())
+
+    def test_AG71_explicit_withdrawal_releases_and_is_shown(self):
+        """AG71 '비 와도 상관없어'(no_condition, 근거 확인) → 조건 해제, 15:00 카드에 '날씨 조건(비)을 빼고' 표시"""
+        _, card = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), ("비 와도 상관없어", ANSWER_C)],
+                            confirms={"비 와도 상관없어": {"answer": "no_condition", "evidence_text": "비 와도 상관없어"}})
+        self.assertEqual(self.start_of(card), ss.iso(at(26, 15)))
+        self.assertIn("날씨 조건(비)을 빼고 제안해요", card["answer"])
+        self.assertIn("weather_condition_withdrawn:avoid_rain", self.rules(card))
+
+    def test_AG72_plain_no_asks_again_then_ends(self):
+        """AG72 단순 '아니'(no) → 다시 질문(카드 없음) → 관련 없는 대답(other) → 반복 상한으로 종료 안내, 초안 없음"""
+        results = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), ("아니", ANSWER_C), ("글쎄", ANSWER_C)],
+                            confirms={"아니": "no", "글쎄": "other"})
+        self.assertTrue(all(r["proposed_action"] is None for r in results))
+        self.assertIn("날씨 조건을 빼고 진행할까요", results[1]["answer"])
+        self.assertIn("날씨 조건을 확인하지 못해 제안하지 않았어요", results[2]["answer"])
+        self.assertIsNone(results[2]["conversation_state"]["draft"])
+
+    def test_AG73_cancel_needs_negation_too(self):
+        """AG73 '등록하지 마'(cancel + 일정 이해 negated) → 초안 폐기. cancel만 있고 negated가 아니면 확정하지 않고 다시 질문"""
+        done = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), ("등록하지 마", dict(ANSWER_C, request_mode="negated"))],
+                         confirms={"등록하지 마": "cancel"})[1]
+        self.assertIsNone(done["conversation_state"]["draft"])
+        self.assertIn("등록하지 않을게요", done["answer"])
+        self.setUp()
+        unsure = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), ("그만", ANSWER_C)], confirms={"그만": "cancel"})[1]
+        self.assertEqual(unsure["missing_fields"], ["weather_condition"])
+
+    def test_AG74_answer_keeps_extra_date(self):
+        """AG74 '응, 모레로' → 조건 유지 + 날짜 11-27 반영 → 지역 '인천' → 11-27 14:00 카드(모레는 시장과 겹치지 않음)"""
+        results = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), ("응, 모레로", dict(ANSWER_C, date_text="모레")),
+                             ("인천", dict(ANSWER_C, city_text="인천"))], confirms={"응, 모레로": {"answer": "yes", "evidence_text": "응"}})
+        self.assertEqual(self.start_of(results[2]), ss.iso(at(27, 14)))
+
+    def test_AG75_update_paths_also_ask(self):
+        """AG75 (D34) 변경: 직접·상대·위임에서 조건을 비우면 카드 없음 + 변경 확인 질문 (수정 전: 15시 비인데 15:00·14:30 카드)"""
+        cases = (("시장 비 안 오게 오후 세 시로 바꿔 줘", {"operation": "update", "target_text": "시장", "new_time_text": "오후 세 시"}),
+                 ("시장 비 안 오게 한 시간 늦춰 줘", {"operation": "update", "target_text": "시장", "shift_text": "한 시간 늦춰",
+                                               "shift_base": "schedule"}),
+                 ("시장 비 안 오는 시간으로 알아서 바꿔 줘", {"operation": "update", "target_text": "시장", "delegate_choice": True}))
+        for text, u in cases:
+            with self.subTest(text):
+                self.setUp()
+                [result] = self.flow([(text, u)], {13: dict(RAIN), 14: dict(RAIN), 15: dict(RAIN)})
+                self.assertIsNone(result["proposed_action"])
+                self.assertIn("비가 오지 않을 때만 변경할까요", result["answer"])
+
+    def test_AG76_requests_without_weather_words_are_not_blocked(self):
+        """AG76 (보존·과잉 차단 점검) 날씨 표현이 없는 일반 등록('준비'·'비빔밥' 포함)은 질문 없이 기존처럼 카드"""
+        for text, u in (("모레 오후 세 시에 친구 집에 갈 거야", {"operation": "create", "title": "친구 집", "date_text": "모레",
+                                                       "time_text": "오후 세 시"}),
+                        ("모레 낮 열두 시에 비빔밥 먹으러 갈 거야", {"operation": "create", "title": "비빔밥", "date_text": "모레",
+                                                          "time_text": "낮 열두 시"}),
+                        ("모레 오후 세 시에 공항 갈 준비 등록해 줘", {"operation": "create", "title": "공항 갈 준비", "date_text": "모레",
+                                                          "time_text": "오후 세 시"})):
+            with self.subTest(text):
+                self.setUp()
+                [result] = self.flow([(text, u)])
+                self.assertIsNotNone(result["proposed_action"], result["answer"])
+                self.assertNotIn("weather_condition_unconfirmed_asked", self.rules(result))
+
+    def test_AG77_city_answer_with_wrong_operation_keeps_draft(self):
+        """AG77 (D36) 조건 있는 등록 → 지역 질문 → '인천'을 모델이 update(위임·조건부·여러 요청)로 표기 → 등록 초안 유지,
+        잘못 붙은 표기는 쓰지 않음 → 맑으면 15:00 카드(지역 인천, '한 번에 하나씩' 안내 없음) / 15시 비면 카드 없음"""
+        wrong = {"operation": "update", "answers_previous_question": True, "city_text": "인천", "delegate_choice": True,
+                 "request_mode": "conditional", "multiple_requests": True, "target_ids": ["schedule_001"]}
+        steps = [(WEATHER_CREATE, dict(WEATHER_CREATE_U, preferences=["avoid_rain"])), ("인천", wrong)]
+        dry = self.flow(steps)
+        self.assertEqual(self.start_of(dry[1]), ss.iso(at(26, 15)))
+        self.assertIn("answer_linked_despite_operation_label", self.rules(dry[1]))
+        self.assertNotIn("한 번에 하나씩", dry[1]["answer"])
+        self.setUp()
+        self.assertIsNone(self.flow(steps, {15: dict(RAIN)})[1]["proposed_action"])
+
+    def test_AG78_new_request_in_answer_does_not_mix_previous_draft(self):
+        """AG78 (D37·H) 날짜 질문 중 새 등록 요청(모델이 answers_previous_question=true를 붙임)은 새 초안: 이전 15:00·인천이 섞이지 않음.
+        모호한 지역 질문 뒤 '광주광역시, 글피로'(모델이 update로 표기)는 대답으로 이어 11-28 15:00 (수정 전: '병원 15:00 인천' 카드)"""
+        first = ("오후 세 시에 인천에서 산책할 거야", {"operation": "create", "title": "산책", "time_text": "오후 세 시",
+                                              "city_text": "인천", "category_guess": "outing"})
+        for text in ("인천이고 내일 병원도 등록해 줘", "내일 병원 가는 거 등록해 줘"):
+            with self.subTest(text):
+                self.setUp()
+                second = self.flow([first, (text, dict(ANSWER_C, title="병원", date_text="내일", city_text="인천" if "인천" in text else ""))])[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertIn("new_create_request_replaced_draft", self.rules(second))
+        self.setUp()
+        gwangju = self.flow([(GWANGJU_CREATE, GWANGJU_CREATE_U),
+                             ("광주광역시, 글피로", dict(ANSWER_U, city_text="광주광역시", date_text="글피"))])[1]
+        self.assertEqual(self.start_of(gwangju), ss.iso(at(28, 15)))
+
+    def test_AG79_duplicated_time_fields(self):
+        """AG79 (D38) 새 시각을 time_text에도 넣은 경우(발화에 한 번만 나옴)는 새 시각으로 보고 시장을 찾는다(충돌 → 17:00).
+        시간대('저녁') 중복도 같다. 서로 다른 대상 시각·새 시각, 같은 표현을 두 번 말한 경우는 기존처럼 대상 조건으로 쓴다."""
+        dup = self.flow([("시장 오후 네 시로 바꿔 줘", {"operation": "update", "target_text": "시장", "time_text": "오후 네 시",
+                                                      "new_time_text": "오후 네 시"})])[0]
+        self.assertEqual(self.start_of(dup), ss.iso(at(26, 17)))
+        self.assertIn("duplicated_time_text_used_as_new_time", self.rules(dup))
+        self.setUp()
+        evening = self.flow([("시장 저녁쯤으로 바꿔 줘", {"operation": "update", "target_text": "시장", "time_text": "저녁",
+                                                     "new_time_text": "저녁"})])[0]
+        self.assertTrue(ss.iso(at(26, 18)) <= self.start_of(evening) < ss.iso(at(26, 21)))
+        self.setUp()
+        period_only = self.flow([("시장 저녁으로 바꿔 줘", {"operation": "update", "target_text": "시장", "time_text": "저녁"})])[0]
+        self.assertTrue(ss.iso(at(26, 18)) <= self.start_of(period_only) < ss.iso(at(26, 21)))
+        self.assertIn("period_text_used_as_new_time", self.rules(period_only))
+        self.setUp()
+        distinct = self.flow([("오후 두 시 일정을 오후 다섯 시로 바꿔 줘", {"operation": "update", "time_text": "오후 두 시",
+                                                                "new_time_text": "오후 다섯 시"})])[0]
+        self.assertEqual(self.start_of(distinct), ss.iso(at(26, 17)))
+        self.setUp()
+        twice = self.flow([("오후 네 시 일정을 오후 네 시로 바꿔 줘", {"operation": "update", "time_text": "오후 네 시",
+                                                              "new_time_text": "오후 네 시"})])[0]
+        self.assertNotIn("duplicated_time_text_used_as_new_time", self.rules(twice))
+        self.assertIsNone(twice["proposed_action"])
+
+    def test_AG80_relative_paraphrase_needs_same_value_direction_base(self):
+        """AG80 (D39) '한 시간 늦출게'를 '한 시간 늦게'로 옮김 → 값·방향·기준이 같아 인정(15:00). 값·방향·기준이 다르거나
+        여러 시간 표현이 섞이면 버리고 시각을 묻는다(근거 없는 값 방어 유지)"""
+        base = {"operation": "update", "target_text": "시장", "shift_base": "schedule"}
+        ok = self.flow([("늦잠 자서 시장 가는 거 한 시간 늦출게", dict(base, shift_text="한 시간 늦게"))])[0]
+        self.assertEqual(self.start_of(ok), ss.iso(at(26, 15)))
+        self.assertIn("shift_paraphrase_verified", self.rules(ok))
+        for text, shift, shift_base in (("늦잠 자서 시장 가는 거 한 시간 늦출게", "두 시간 늦게", "schedule"),
+                                        ("늦잠 자서 시장 가는 거 한 시간 늦출게", "한 시간 앞당겨", "schedule"),
+                                        ("늦잠 자서 시장 가는 거 한 시간 늦출게", "한 시간 늦게", "now"),
+                                        ("시장 지금부터 두 시간 뒤 말고 한 시간 늦출게", "한 시간 늦게", "schedule")):
+            with self.subTest(shift=shift, base=shift_base, text=text):
+                self.setUp()
+                result = self.flow([(text, dict(base, shift_text=shift, shift_base=shift_base))])[0]
+                self.assertIsNone(result["proposed_action"])
+                self.assertNotIn("shift_paraphrase_verified", self.rules(result))
+
+    def test_AG81_delegation_needs_clear_consent(self):
+        """AG81 (D42) 조건은 있고 시각·위임 표현이 없으면 '골라 드릴까요?' 확인 → yes: 비 없는 후보(15:00) / 시각을 말함: 그 시각.
+        '알아서'(delegate_choice=true)는 바로 위임(AG22 보존)"""
+        ask = ("시장 비 안 오는 시간으로 바꿔 줘", {"operation": "update", "target_text": "시장", "preferences": ["avoid_rain"]})
+        rain = {13: dict(RAIN), 14: dict(RAIN)}
+        results = self.flow([ask, ("응", ANSWER_U)], rain, confirms={"응": {"answer": "yes", "evidence_text": "응"}})
+        self.assertEqual(results[0]["missing_fields"], ["delegate_confirm"])
+        self.assertIn("제가 골라 드릴까요", results[0]["answer"])
+        self.assertEqual(self.start_of(results[1]), ss.iso(at(26, 15)))
+        self.setUp()
+        told = self.flow([ask, ("오후 다섯 시로", dict(ANSWER_U, new_time_text="오후 다섯 시"))], rain)
+        self.assertEqual(self.start_of(told[1]), ss.iso(at(26, 17)))
+
+    def test_AG82_cancel_with_negation_is_confirmed(self):
+        """AG82 (D43) '안 갈래'가 cancel+negated로 나오면 유지로 확정하지 않고 '취소할까요?' → yes: 취소 카드(승인 필요) / '아니': 유지"""
+        first = ("내일 장보기는 안 갈래", {"operation": "cancel", "request_mode": "negated", "target_text": "장보기", "date_text": "내일"})
+        yes = self.flow([first, ("응", {"operation": "cancel", "answers_previous_question": True})],
+                        confirms={"응": {"answer": "yes", "evidence_text": "응"}})
+        self.assertEqual(yes[0]["missing_fields"], ["cancel_confirm"])
+        self.assertIn("일정을 취소할까요?", yes[0]["answer"])
+        self.assertEqual(got(yes[1], "proposed_action")["type"], "cancel_schedule")
+        self.setUp()
+        no = self.flow([first, ("아니", {"operation": "cancel", "request_mode": "negated"})], confirms={"아니": "no"})
+        self.assertIsNone(no[1]["proposed_action"])
+        self.assertIn("그대로", no[1]["answer"])
+
+    def test_AG83_check_weather_without_preference_still_asks(self):
+        """AG83 (D34) check_weather=true만 있고 조건이 비면 → 카드 없음, 비 조건 확인 질문 (수정 전: 15:00 카드에 비 예보만 표시)"""
+        text = "내일 오후 두 시에 인천에서 비 안 오면 산책 등록해 줘"
+        [result] = self.flow([(text, dict(WEATHER_CREATE_U, city_text="인천", check_weather=True))], {15: dict(RAIN)})
+        self.assertIsNone(result["proposed_action"])
+        self.assertIn("비가 오지 않을 때만", result["answer"])
+
+    def test_AG84_partial_extraction_asks_the_missing_condition(self):
+        """AG84 (D34) 비·바람 중 비만 추출 → 카드 없음, 빠진 '바람' 조건으로 묻는다(비 질문으로 묻지 않음)"""
+        text = "시장 비 안 오고 바람 안 부는 시간으로 오후 세 시로 바꿔 줘"
+        [result] = self.flow([(text, {"operation": "update", "target_text": "시장", "new_time_text": "오후 세 시",
+                                      "preferences": ["avoid_rain"]})], {15: dict(WINDY)})
+        self.assertIsNone(result["proposed_action"])
+        self.assertIn("바람이 강하지 않을 때만", result["answer"])
+        self.assertNotIn("비가 오지 않을 때만", result["answer"])
+
+    def test_AG85_new_condition_is_added_not_replacing(self):
+        """AG85 (D44) 확정된 비 조건 + 다음 턴에 바람 조건 추가 → 두 조건 모두 유지, 비 구간(18·19시) 후보를 고르지 않음
+        (수정 전: 초안 조건이 바람으로 바뀌어 비 2mm인 19:00 카드)"""
+        results = self.flow([("내일 저녁 비 안 오는 시간에 산책 등록해 줘", {"operation": "create", "title": "산책", "date_text": "내일",
+                                                                     "time_text": "저녁", "preferences": ["avoid_rain"],
+                                                                     "category_guess": "outing"}),
+                             ("인천, 바람도 안 불었으면 좋겠어", dict(ANSWER_C, city_text="인천", preferences=["avoid_wind"]))],
+                            {18: dict(RAIN), 19: dict(RAIN)}, choices=[{"choice": "none", "reasons": []}])
+        self.assertEqual(results[1]["conversation_state"]["draft"]["preferences"], ["avoid_rain", "avoid_wind"])
+        card = results[1]["proposed_action"]
+        if card is not None:
+            self.assertFalse(card["payload"]["after"]["start_at"][11:13] in ("18", "19"))
+
+    def test_AG86_confirm_output_is_not_trusted_alone(self):
+        """AG86 확인 단계 오판 방어: '응'을 no_condition으로 / '아니'를 yes로 / '상관없어'(조건 낱말 없음)를 no_condition으로 내도
+        조건을 해제하거나 진행하지 않고 다시 묻는다(카드 없음)"""
+        for answer, value in (("응", {"answer": "no_condition", "evidence_text": "응"}), ("아니", "yes"),
+                              ("상관없어", {"answer": "no_condition", "evidence_text": "상관없어"})):
+            with self.subTest(answer):
+                self.setUp()
+                second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), (answer, ANSWER_C)], confirms={answer: value})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertEqual(second["missing_fields"], ["weather_condition"])
+                self.assertNotIn("weather_condition_withdrawn:avoid_rain", self.rules(second))
+
+    def test_AG87_avoidance_words_reject_withdrawal(self):
+        """AG87 '비가 오면 안 돼'·'비는 피하고 싶어'를 no_condition으로 오판해도 회피 표지가 있어 철회하지 않는다"""
+        for answer in ("비가 오면 안 돼", "비는 피하고 싶어"):
+            with self.subTest(answer):
+                self.setUp()
+                second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), (answer, ANSWER_C)],
+                                   confirms={answer: {"answer": "no_condition", "evidence_text": answer}})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertNotIn("weather_condition_withdrawn:avoid_rain", self.rules(second))
+
+    def test_AG88_partial_withdrawal_and_unclear_scope(self):
+        """AG88 비·바람을 물었는데 '바람은 상관없어' → 바람만 해제하고 비는 다시 묻는다. '상관없어'는 범위가 불명확해 둘 다 다시 묻는다"""
+        text = "내일 오후 두 시에 비 안 오고 바람 안 불면 산책 등록해 줘"
+        first = (text, WEATHER_CREATE_U)
+        part = self.flow([first, ("바람은 상관없어", ANSWER_C)],
+                         confirms={"바람은 상관없어": {"answer": "no_condition", "evidence_text": "바람은 상관없어"}})[1]
+        self.assertIn("weather_condition_withdrawn:avoid_wind", self.rules(part))
+        self.assertIn("비가 오지 않을 때만", part["answer"])
+        self.assertIsNone(part["proposed_action"])
+        self.setUp()
+        vague = self.flow([first, ("상관없어", ANSWER_C)], confirms={"상관없어": {"answer": "no_condition", "evidence_text": "상관없어"}})[1]
+        self.assertIsNone(vague["proposed_action"])
+        self.assertFalse([r for r in self.rules(vague) if r.startswith("weather_condition_withdrawn")])
+
+    def test_AG89_new_request_during_confirmation_is_not_an_answer(self):
+        """AG89 확인 턴에 '응, 그리고 내일 병원도 등록해 줘'(새 이름) → 대답으로 쓰지 않고 새 초안, 산책·15:00이 섞이지 않음"""
+        second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U),
+                            ("응, 그리고 내일 병원도 등록해 줘", dict(ANSWER_C, title="병원", date_text="내일", multiple_requests=True))],
+                           confirms={"응, 그리고 내일 병원도 등록해 줘": "yes"})[1]
+        self.assertIsNone(second["proposed_action"])
+        self.assertIn("new_create_request_replaced_draft", self.rules(second))
+
+    def test_AG90_confirmation_limits_on_every_path(self):
+        """AG90 반복 상한: 위임 확인에 판단 불가(other) → 시각 질문으로 넘어감 / 취소 확인에 판단 불가 2회 → 유지 안내, 카드 없음 /
+        위임 확인에 '아니'를 yes로 오판 → 위임하지 않고 시각 질문"""
+        ask = ("시장 비 안 오는 시간으로 바꿔 줘", {"operation": "update", "target_text": "시장", "preferences": ["avoid_rain"]})
+        other = self.flow([ask, ("글쎄", ANSWER_U)], confirms={"글쎄": "other"})[1]
+        self.assertEqual(other["missing_fields"], ["time"])
+        self.setUp()
+        wrong_yes = self.flow([ask, ("아니", ANSWER_U)], confirms={"아니": "yes"})[1]
+        self.assertEqual(wrong_yes["missing_fields"], ["time"])
+        self.setUp()
+        first = ("내일 장보기는 안 갈래", {"operation": "cancel", "request_mode": "negated", "target_text": "장보기", "date_text": "내일"})
+        results = self.flow([first, ("글쎄", {"operation": "cancel"}), ("음", {"operation": "cancel"})], confirms={"글쎄": "other", "음": "other"})
+        self.assertTrue(all(r["proposed_action"] is None for r in results))
+        self.assertIsNone(results[2]["conversation_state"]["draft"])
+
+    def test_AG91_existing_defenses_are_kept(self):
+        """AG91 (보존) 조건부 등록 → 미지원 안내 / 변경 conditional·조건 없음 → '어떤 날씨일 때' / negated 변경 → 유지 /
+        이름 질문에 대한 새 이름 대답은 같은 초안('병원' 15:00 인천) / 일반 '응' 긍정·'날씨 상관없이 해 줘' 철회는 정상 진행"""
+        self.assertEqual(self.flow([("비 오면 내일 아침 여덟 시에 산책 등록해 줘", {"operation": "create", "request_mode": "conditional",
+                                                                       "title": "산책", "date_text": "내일", "time_text": "아침 여덟 시"})])[0]
+                         ["decision"]["kind"], "schedule_condition_unsupported")
+        self.setUp()
+        self.assertEqual(self.flow([("시장 비 오면 바꿀까?", {"operation": "update", "request_mode": "conditional", "target_text": "시장"})])[0]
+                         ["missing_fields"], ["condition"])
+        self.setUp()
+        self.assertEqual(self.flow([("시장 비 안 오게 오후 세 시로 바꿔 줘", {"operation": "update", "request_mode": "negated",
+                                                                     "target_text": "시장", "new_time_text": "오후 세 시"})])[0]
+                         ["decision"]["kind"], "schedule_kept")
+        self.setUp()
+        named = self.flow([("내일 오후 세 시에 인천에서 등록해 줘", {"operation": "create", "date_text": "내일", "time_text": "오후 세 시",
+                                                                "city_text": "인천"}),
+                           ("내일 병원 가는 거 등록해 줘", dict(ANSWER_C, title="병원", date_text="내일"))])[1]
+        self.assertEqual(self.start_of(named), ss.iso(at(26, 15)))
+        self.setUp()
+        waived = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), ("날씨 상관없이 해 줘", ANSWER_C)],
+                           confirms={"날씨 상관없이 해 줘": {"answer": "no_condition", "evidence_text": "날씨 상관없이"}})[1]
+        self.assertEqual(self.start_of(waived), ss.iso(at(26, 15)))
+
+
+# %% I-AG15. (5-6 D45~D50) 확인 대답 안전 검증 회귀
+# 핵심 요약: 서로 다른 날씨 조건의 철회·회피를 섞지 않고(D45), 부분 근거·양보·부정·질문 표현으로 철회하지 않으며(D46),
+# 근거 없는·불확실한 긍정으로 위임·취소를 확정하지 않는다(D47). 확인 질문 중 다른 요청을 대답으로 섞지 않고(D49),
+# 조건부 변경에서 일부만 추출된 조건과 날씨 낱말이 있는 취소를 확인 없이 제안하지 않는다(D50). 모든 사례는 승인 전 파일 불변이다.
+RAIN_WIND_CREATE = "내일 오후 두 시에 비 안 오고 바람 안 불면 산책 등록해 줘"
+CONFIRM_ASK_U = ("시장 비 안 오는 시간으로 바꿔 줘", {"operation": "update", "target_text": "시장", "preferences": ["avoid_rain"]})
+CANCEL_NEGATED = ("내일 장보기는 안 갈래", {"operation": "cancel", "request_mode": "negated", "target_text": "장보기", "date_text": "내일"})
+
+
+def yes(evidence: str) -> dict[str, str]:
+    return {"answer": "yes", "evidence_text": evidence}
+
+
+class I_AG15_ConfirmSafety(AgentCase):
+    flow = I_AG14_WeatherConditionGuard.flow
+    start_of = I_AG14_WeatherConditionGuard.start_of
+    rules = I_AG14_WeatherConditionGuard.rules
+
+    def withdrawn(self, result: dict[str, Any]) -> list[str]:
+        return sorted(r.split(":", 1)[1] for r in self.rules(result) if r.startswith("weather_condition_withdrawn:"))
+
+    def test_AG100_waiver_of_one_condition_keeps_the_other(self):
+        """AG100 (D45) '비 안 오는 시간에 … 바람은 상관없어'에서 모델이 조건을 비움 → 바람만 철회, 비는 묻는다(카드 없음)
+        (수정 전: 두 조건이 모두 철회되어 9~15시가 모두 비인데 15:00 카드)"""
+        for text in ("내일 비 안 오는 시간에 산책 등록해 줘. 바람은 상관없어", "비 안 오는 시간으로 등록해 줘. 바람은 상관없어"):
+            self.assertEqual(sa.explicit_waiver(text, ["avoid_rain", "avoid_wind"]), ["avoid_wind"], text)
+        text = "내일 인천에서 비 안 오는 시간에 산책 등록해 줘. 바람은 상관없어"
+        u = {"operation": "create", "title": "산책", "date_text": "내일", "city_text": "인천", "delegate_choice": True,
+             "category_guess": "outing"}
+        [result] = self.flow([(text, u)], {h: dict(RAIN) for h in range(9, 16)})
+        self.assertIsNone(result["proposed_action"])
+        self.assertEqual(result["missing_fields"], ["weather_condition"])
+        self.assertIn("비가 오지 않을 때만", result["answer"])
+        self.assertEqual(self.withdrawn(result), ["avoid_wind"])
+
+    def test_AG101_mixed_answer_withdraws_only_the_named_condition(self):
+        """AG101 (D45) 비·바람을 물은 뒤 '비 안 오는 게 좋고 바람은 상관없어'(no_condition, 근거 전체) → 바람만 철회, 비는 다시 묻는다"""
+        answer = "비 안 오는 게 좋고 바람은 상관없어"
+        second = self.flow([(RAIN_WIND_CREATE, WEATHER_CREATE_U), (answer, ANSWER_C)],
+                           confirms={answer: {"answer": "no_condition", "evidence_text": answer}})[1]
+        self.assertIsNone(second["proposed_action"])
+        self.assertEqual(self.withdrawn(second), ["avoid_wind"])
+        self.assertIn("비가 오지 않을 때만", second["answer"])
+
+    def test_AG102_partial_evidence_concession_negation_question_do_not_withdraw(self):
+        """AG102 (D46) 부분 근거·양보만·부정·질문·'비 없이'를 no_condition으로 오판해도 철회하지 않고 다시 묻는다(카드 없음).
+        첫 발화의 '비 없이'·'비 와도'(양보만)도 묻지 않고 철회하지 않는다"""
+        for answer, evidence in (("비 와도 안 돼", "비 와도"), ("비 와도 산책은 하지 마", "비 와도"),
+                                 ("비 와도 상관없지 않아", "비 와도 상관없지 않아"), ("비가 와도 괜찮을까", "비가 와도 괜찮을까"),
+                                 ("비 없이 산책하고 싶어", "비 없이"), ("비 와도", "비 와도")):
+            with self.subTest(answer):
+                self.setUp()
+                second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), (answer, ANSWER_C)], {14: dict(RAIN), 15: dict(RAIN)},
+                                   confirms={answer: {"answer": "no_condition", "evidence_text": evidence}})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertEqual(second["missing_fields"], ["weather_condition"])
+                self.assertEqual(self.withdrawn(second), [])
+        for text in ("내일 오후 두 시에 비 없이 산책하고 싶어", "내일 오후 두 시에 비 와도 산책 등록해 줘"):
+            with self.subTest(text):
+                self.setUp()
+                [first] = self.flow([(text, dict(WEATHER_CREATE_U, reason_text=""))], {14: dict(RAIN), 15: dict(RAIN)})
+                self.assertIsNone(first["proposed_action"])
+                self.assertEqual(first["missing_fields"], ["weather_condition"])
+                self.assertEqual(self.withdrawn(first), [])
+
+    def test_AG103_explicit_withdrawals_are_kept(self):
+        """AG103 (보존) 명시적 철회는 그대로: '비 와도 상관없어'·'비 와도 괜찮아' → 비, '비 와도 바람 불어도 상관없어'·'비랑 바람 상관없어'
+        ·'날씨 상관없이 해 줘' → 둘 다, '바람은 상관없어' → 바람, '상관없어' → 없음. 근거 없는 no_condition은 철회하지 않는다"""
+        both = ["avoid_rain", "avoid_wind"]
+        for text, want in (("비 와도 상관없어", ["avoid_rain"]), ("비 와도 괜찮아", ["avoid_rain"]),
+                           ("비 와도 바람 불어도 상관없어", both), ("비랑 바람 상관없어", both), ("날씨 상관없이 해 줘", both),
+                           ("바람은 상관없어", ["avoid_wind"]), ("상관없어", [])):
+            self.assertEqual(sorted(sa.explicit_waiver(text, both)), want, text)
+        second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), ("비 와도 상관없어", ANSWER_C)],
+                           confirms={"비 와도 상관없어": {"answer": "no_condition", "evidence_text": ""}})[1]
+        self.assertIsNone(second["proposed_action"])
+        self.assertEqual(self.withdrawn(second), [])
+
+    def test_AG104_uncertain_or_negated_yes_does_not_confirm_condition(self):
+        """AG104 (D47) 날씨 조건 확인: 근거 없음·'글쎄'(근거 '글쎄')·'잘 모르겠어'·'아직 모르겠어'·'그렇게 하지 마'에 yes → 확정하지 않고
+        다시 묻는다. 정상 긍정 '응'·'네 그렇게 해 줘'와 조건 유지 표현 '비는 피하고 싶어'는 확정 → 지역 질문"""
+        for answer, evidence in (("글쎄", ""), ("글쎄", "글쎄"), ("잘 모르겠어", "잘 모르겠어"), ("아직 모르겠어", "아직 모르겠어"),
+                                 ("그렇게 하지 마", "그렇게 하지 마")):
+            with self.subTest(answer=answer, evidence=evidence):
+                self.setUp()
+                second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), (answer, ANSWER_C)], confirms={answer: yes(evidence)})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertEqual(second["missing_fields"], ["weather_condition"])
+                self.assertNotIn("weather_condition_confirmed", self.rules(second))
+        for answer in ("응", "네 그렇게 해 줘", "비는 피하고 싶어"):
+            with self.subTest(answer):
+                self.setUp()
+                second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), (answer, ANSWER_C)], confirms={answer: yes(answer)})[1]
+                self.assertEqual(second["missing_fields"], ["city"])
+                self.assertIn("weather_condition_confirmed", self.rules(second))
+
+    def test_AG105_uncertain_yes_does_not_delegate(self):
+        """AG105 (D47) 위임 확인: '글쎄'(근거 '글쎄'·없음)·'잘 모르겠어'·'그렇게 하지 마'·'비는 피하고 싶어'에 yes → 위임하지 않고 시각 질문(카드 없음).
+        '응'(근거) → 비 없는 15:00 카드 (수정 전: 모두 위임 확정 + 15:00 카드)"""
+        rain = {13: dict(RAIN), 14: dict(RAIN)}
+        for answer, evidence in (("글쎄", "글쎄"), ("글쎄", ""), ("잘 모르겠어", "잘 모르겠어"), ("그렇게 하지 마", "그렇게 하지 마"),
+                                 ("비는 피하고 싶어", "비는 피하고 싶어")):
+            with self.subTest(answer=answer, evidence=evidence):
+                self.setUp()
+                second = self.flow([CONFIRM_ASK_U, (answer, ANSWER_U)], rain, confirms={answer: yes(evidence)})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertEqual(second["missing_fields"], ["time"])
+                self.assertNotIn("delegation_confirmed", self.rules(second))
+        self.setUp()
+        good = self.flow([CONFIRM_ASK_U, ("응", ANSWER_U)], rain, confirms={"응": yes("응")})[1]
+        self.assertEqual(self.start_of(good), ss.iso(at(26, 15)))
+
+    def test_AG106_uncertain_yes_does_not_cancel(self):
+        """AG106 (D47) 취소 확인: '글쎄'(근거 '글쎄')·'아직 모르겠어'·'그렇게 하지 마'·'비는 피하고 싶어'에 yes → 취소 카드 없이 다시 묻는다.
+        '응'(근거) → 취소 카드(승인 필요) (수정 전: 모두 취소 카드)"""
+        answer_u = {"operation": "cancel", "answers_previous_question": True}
+        for answer in ("글쎄", "아직 모르겠어", "그렇게 하지 마", "비는 피하고 싶어"):
+            with self.subTest(answer):
+                self.setUp()
+                second = self.flow([CANCEL_NEGATED, (answer, answer_u)], confirms={answer: yes(answer)})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertEqual(second["missing_fields"], ["cancel_confirm"])
+        self.setUp()
+        good = self.flow([CANCEL_NEGATED, ("응", answer_u)], confirms={"응": yes("응")})[1]
+        self.assertEqual(got(good, "proposed_action")["type"], "cancel_schedule")
+
+    def test_AG107_other_requests_during_confirmation_are_not_merged(self):
+        """AG107 (D49) 날씨 조건 확인 중: ① 다른 작업의 대상('병원 예약 취소해 줘')은 대답으로 잇지 않는다 ② 다른 작업·other 표기에
+        날짜가 있으면(대답인지 불확실) 섞지 않고 다시 묻는다 ③ 버려진 다른 제목(대답 표시 true)·정정 표기의 다른 제목은 새 초안"""
+        steps0 = (WEATHER_CREATE, WEATHER_CREATE_U)
+        cancel = self.flow([steps0, ("병원 예약 취소해 줘", {"operation": "cancel", "target_text": "병원"})])[1]
+        self.assertNotIn("answer_linked_despite_operation_label", self.rules(cancel))
+        self.assertIsNone(cancel["proposed_action"])
+        self.assertIn("변경 제한", cancel["answer"])
+        for text, u in (("모레 병원 가는 거 등록해 줘", {"operation": "other", "date_text": "모레"}),
+                        ("인천, 모레로", {"operation": "update", "city_text": "인천", "date_text": "모레"})):
+            with self.subTest(text):
+                self.setUp()
+                results = self.flow([steps0, (text, u), ("응", ANSWER_C)], confirms={text: yes(text), "응": yes("응")})
+                self.assertIn("unclear_answer_not_merged", self.rules(results[1]))
+                self.assertIsNone(results[1]["proposed_action"])
+                self.assertEqual(results[1]["missing_fields"], ["weather_condition"])
+                draft = results[1]["conversation_state"]["draft"]
+                self.assertFalse([v for v in draft["pending"].values() if v in ("모레", "2026-11-27")])
+                self.assertEqual(results[2]["conversation_state"]["draft"]["date"], "2026-11-26")    # 산책 날짜는 내일 그대로
+        for u in ({"operation": "create", "title": "병원 예약", "date_text": "모레", "answers_previous_question": True},
+                  {"operation": "create", "title": "병원", "date_text": "모레", "request_mode": "correction"}):
+            with self.subTest(u):
+                self.setUp()
+                second = self.flow([steps0, ("모레 병원 가는 거 등록해 줘", u)], confirms={"모레 병원 가는 거 등록해 줘": yes("등록해 줘")})[1]
+                self.assertIn("new_create_request_replaced_draft", self.rules(second))
+                self.assertNotIn("weather_condition_confirmed", self.rules(second))
+                self.assertNotEqual(second["conversation_state"]["draft"]["title"], "산책")
+                self.assertEqual(second["conversation_state"]["draft"]["preferences"], [])
+        # (보존) 실측 LV2-direct-rain-1의 출력 모양: 지역 대답 '인천'을 target_text·city_text에 함께 적고 근거 없는 이름('인천 방문')을 붙임
+        # → 새 요청으로 보지 않고 산책 초안을 유지한다(확인 질문은 계속).
+        self.setUp()
+        city_like = {"operation": "create", "answers_previous_question": True, "target_text": "인천", "city_text": "인천", "title": "인천 방문"}
+        kept = self.flow([steps0, ("인천", city_like)])[1]
+        self.assertNotIn("new_create_request_replaced_draft", self.rules(kept))
+        self.assertEqual(kept["conversation_state"]["draft"]["title"], "산책")
+        self.assertIsNone(kept["proposed_action"])
+
+    def test_AG108_short_city_answer_is_still_linked(self):
+        """AG108 (보존) 확인 질문이 아닌 지역 질문의 '인천'(other 표기)은 지금처럼 대답으로 이어 15:00 카드"""
+        results = self.flow([(WEATHER_CREATE, dict(WEATHER_CREATE_U, preferences=["avoid_rain"])),
+                             ("인천", {"operation": "other", "city_text": "인천"})])
+        self.assertEqual(results[0]["missing_fields"], ["city"])
+        self.assertEqual(self.start_of(results[1]), ss.iso(at(26, 15)))
+
+    def test_AG109_conditional_update_asks_the_missing_condition(self):
+        """AG109 (D50) 조건부로 분류됐는데 비만 추출(발화에는 바람도) → 카드 없음, 바람 조건 확인 → '응' → 두 조건으로 판단(바람 구간 카드 없음)
+        (수정 전: 14시 비로 조건 충족 → 강풍인 15:00 카드)"""
+        forecast = {14: dict(RAIN), 15: dict(WINDY), 16: dict(WINDY), 17: dict(WINDY)}
+        text = "시장 비랑 바람 피해서 오후 다섯 시로 바꿔 줘"
+        u = {"operation": "update", "target_text": "시장", "new_time_text": "오후 다섯 시", "request_mode": "conditional",
+             "preferences": ["avoid_rain"]}
+        results = self.flow([(text, u), ("응", ANSWER_U)], forecast, confirms={"응": yes("응")})
+        self.assertIsNone(results[0]["proposed_action"])
+        self.assertEqual(results[0]["missing_fields"], ["weather_condition"])
+        self.assertIn("바람", results[0]["answer"])
+        self.assertIn("함께 확인할까요", results[0]["answer"])
+        self.assertEqual(results[1]["conversation_state"]["draft"]["preferences"], ["avoid_rain", "avoid_wind"])
+        card = results[1]["proposed_action"]
+        if card is not None:
+            self.assertNotIn(card["payload"]["after"]["start_at"][11:13], ("14", "15", "16", "17"))
+        self.setUp()
+        [asked] = self.flow([("비 오거나 바람 불면 시장 시간 바꿀까?", {"operation": "update", "target_text": "시장",
+                                                              "request_mode": "conditional", "preferences": ["avoid_rain"]})], forecast)
+        self.assertIsNone(asked["proposed_action"])
+        self.assertEqual(asked["missing_fields"], ["weather_condition"])
+
+    def test_AG110_cancel_with_weather_words_is_confirmed_first(self):
+        """AG110 (D50 보완) '비 오면 내일 장보기 취소해 줘'를 모델이 조건 없는 일반 요청으로 표기 → 카드 없이 날씨 문구 취소 확인
+        → '응'(근거): 취소 카드 / '아니': 유지. 날씨 낱말 없는 취소는 바로 카드(보존) (수정 전: 비 조건을 무시한 취소 카드)"""
+        first = ("비 오면 내일 장보기 취소해 줘", {"operation": "cancel", "target_text": "장보기", "date_text": "내일"})
+        results = self.flow([first, ("응", {"operation": "cancel", "answers_previous_question": True})], confirms={"응": yes("응")})
+        self.assertIsNone(results[0]["proposed_action"])
+        self.assertEqual(results[0]["missing_fields"], ["cancel_confirm"])
+        self.assertIn("날씨와 관계없이", results[0]["answer"])
+        self.assertIn("cancel_weather_confirm_asked", self.rules(results[0]))
+        self.assertEqual(got(results[1], "proposed_action")["type"], "cancel_schedule")
+        self.setUp()
+        kept = self.flow([first, ("아니", {"operation": "cancel", "request_mode": "negated"})], confirms={"아니": "no"})[1]
+        self.assertIsNone(kept["proposed_action"])
+        self.assertIn("그대로", kept["answer"])
+        self.setUp()
+        [plain] = self.flow([("내일 장보기 취소해 줘", {"operation": "cancel", "target_text": "장보기", "date_text": "내일"})])
+        self.assertEqual(got(plain, "proposed_action")["type"], "cancel_schedule")
+
+    # (5-6 D53·D54) 확인 대답 턴의 위임 표기 재사용과 불확실·금지 표현이 섞인 철회
+    def test_AG111_declined_delegation_is_not_restored_by_the_label(self):
+        """AG111 (D53 변경) 위임 확인 → '글쎄'·'잘 모르겠어'·'그렇게 하지 마'·'아니' + 일정 이해 delegate_choice=true 오판,
+        확인 단계 yes(근거)·other → 위임하지 않고 시각 질문(카드 없음) (수정 전: 위임 확정되어 15:00 카드)"""
+        rain = {13: dict(RAIN), 14: dict(RAIN)}
+        for answer in ("글쎄", "잘 모르겠어", "그렇게 하지 마", "아니"):
+            for confirm in (yes(answer), "other"):
+                with self.subTest(answer=answer, confirm=confirm):
+                    self.setUp()
+                    second = self.flow([CONFIRM_ASK_U, (answer, dict(ANSWER_U, delegate_choice=True))], rain,
+                                       confirms={answer: confirm})[1]
+                    self.assertIsNone(second["proposed_action"])
+                    self.assertEqual(second["missing_fields"], ["time"])
+                    self.assertFalse(second["conversation_state"]["draft"]["delegate"])
+
+    def test_AG112_declined_delegation_on_create_is_not_restored(self):
+        """AG112 (D53 등록) 등록 위임 확인 → '글쎄'·'그렇게 하지 마'·'아니' + delegate_choice=true 오판 → 카드 없음, 시각 질문"""
+        first = ("내일 인천에서 비 안 오는 시간에 산책 등록해 줘", {"operation": "create", "title": "산책", "date_text": "내일",
+                                                       "city_text": "인천", "preferences": ["avoid_rain"], "category_guess": "outing"})
+        for answer in ("글쎄", "그렇게 하지 마", "아니"):
+            with self.subTest(answer):
+                self.setUp()
+                results = self.flow([first, (answer, dict(ANSWER_C, delegate_choice=True))], {13: dict(RAIN), 14: dict(RAIN)},
+                                    confirms={answer: yes(answer)})
+                self.assertEqual(results[0]["missing_fields"], ["delegate_confirm"])
+                self.assertIsNone(results[1]["proposed_action"])
+                self.assertEqual(results[1]["missing_fields"], ["time"])
+
+    def test_AG113_weather_answer_label_does_not_skip_delegation_question(self):
+        """AG113 (D53-b) 날씨 조건 확인 대답 '응'(근거) + delegate_choice=true 오판 → 위임 확인 질문(D42)을 건너뛰지 않는다(카드 없음)
+        (수정 전: 위임 확인 없이 15:00 카드)"""
+        first = ("내일 인천에서 비 안 오면 산책 등록해 줘", {"operation": "create", "title": "산책", "date_text": "내일", "city_text": "인천",
+                                                   "category_guess": "outing"})
+        results = self.flow([first, ("응", dict(ANSWER_C, delegate_choice=True))], {13: dict(RAIN), 14: dict(RAIN)},
+                            confirms={"응": yes("응")})
+        self.assertEqual(results[0]["missing_fields"], ["weather_condition"])
+        self.assertIsNone(results[1]["proposed_action"])
+        self.assertEqual(results[1]["missing_fields"], ["delegate_confirm"])
+
+    def test_AG114_real_delegation_still_works(self):
+        """AG114 (D53 보존) 위임 확인 '응'(근거) → 15:00 카드 / '오후 다섯 시로' + 오판 → 17:00(직접 시각 우선) /
+        거절 뒤 다음 턴 '그냥 알아서 골라 줘'(delegate_choice=true) → 15:00 카드(명시적 새 위임)"""
+        rain = {13: dict(RAIN), 14: dict(RAIN)}
+        good = self.flow([CONFIRM_ASK_U, ("응", dict(ANSWER_U, delegate_choice=True))], rain, confirms={"응": yes("응")})[1]
+        self.assertEqual(self.start_of(good), ss.iso(at(26, 15)))
+        self.setUp()
+        told = self.flow([CONFIRM_ASK_U, ("오후 다섯 시로", dict(ANSWER_U, new_time_text="오후 다섯 시", delegate_choice=True))], rain)[1]
+        self.assertEqual(self.start_of(told), ss.iso(at(26, 17)))
+        self.setUp()
+        later = self.flow([CONFIRM_ASK_U, ("글쎄", ANSWER_U), ("그냥 알아서 골라 줘", dict(ANSWER_U, delegate_choice=True))], rain,
+                          confirms={"글쎄": "other"})
+        self.assertEqual(later[1]["missing_fields"], ["time"])
+        self.assertEqual(self.start_of(later[2]), ss.iso(at(26, 15)))
+
+    def test_AG115_uncertain_or_prohibitive_waiver_keeps_the_condition(self):
+        """AG115 (D54) 불확실·금지 표현이 섞인 철회는 인정하지 않는다: 함수 단위 / 첫 발화(모델 조건 누락) / 확인 대답 no_condition(근거 전체·부분)
+        (수정 전: 모두 비 조건 철회 → 14·15시 비인데 15:00 카드)"""
+        for text in ("비 와도 괜찮을지 모르겠어", "비 와도 괜찮아 보이지만 가지 마", "비 와도 상관없는지 잘 모르겠어", "비 와도 괜찮을 것 같긴 한데 글쎄"):
+            self.assertEqual(sa.explicit_waiver(text, ["avoid_rain", "avoid_wind"]), [], text)
+        rain = {14: dict(RAIN), 15: dict(RAIN)}
+        for tail in ("비 와도 괜찮을지 모르겠어", "비 와도 괜찮아 보이지만 가지 마"):
+            with self.subTest(first=tail):
+                self.setUp()
+                [first] = self.flow([(f"내일 오후 두 시에 산책 등록해 줘. {tail}", dict(WEATHER_CREATE_U, reason_text=""))], rain)
+                self.assertIsNone(first["proposed_action"])
+                self.assertEqual(first["missing_fields"], ["weather_condition"])
+                self.assertEqual(self.withdrawn(first), [])
+        for answer, evidence in (("비 와도 괜찮을지 모르겠어", "비 와도 괜찮을지 모르겠어"), ("비 와도 괜찮을지 모르겠어", "비 와도 괜찮"),
+                                 ("비 와도 괜찮아 보이지만 가지 마", "비 와도 괜찮아")):
+            with self.subTest(answer=answer, evidence=evidence):
+                self.setUp()
+                second = self.flow([(WEATHER_CREATE, WEATHER_CREATE_U), (answer, ANSWER_C)], rain,
+                                   confirms={answer: {"answer": "no_condition", "evidence_text": evidence}})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertEqual(second["missing_fields"], ["weather_condition"])
+                self.assertEqual(self.withdrawn(second), [])
+
+    def test_AG116_plain_waivers_are_unchanged(self):
+        """AG116 (D54 보존) 정상 철회는 그대로: 비 와도 괜찮아·비 와도 상관없어 → 비, 비랑 바람 상관없어·날씨 상관없이 → 둘 다,
+        '비 안 오는 시간에 산책하고 바람은 상관없어'·'비 오면 하지 말고 바람은 상관없어' → 바람만"""
+        both = ["avoid_rain", "avoid_wind"]
+        for text, want in (("비 와도 괜찮아", ["avoid_rain"]), ("비 와도 상관없어", ["avoid_rain"]), ("비랑 바람 상관없어", both),
+                           ("날씨 상관없이", both), ("비 안 오는 시간에 산책하고 바람은 상관없어", ["avoid_wind"]),
+                           ("비 오면 하지 말고 바람은 상관없어", ["avoid_wind"])):
+            self.assertEqual(sorted(sa.explicit_waiver(text, both)), want, text)
+
+
 class M_AG7_LiveJudge(StoreCase):
 
     def test_AG39_proposal_judge_checks_time_duration_and_target(self):
