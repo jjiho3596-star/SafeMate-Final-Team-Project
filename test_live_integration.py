@@ -341,11 +341,12 @@ def scenario(sid: str, suite: str, turns: list[str], *, basis: str, title: str =
              forecast: dict[str, Any] | None = None, a: dict[str, dict] | None = None, s: dict[str, dict] | None = None,
              choices: list[dict] | None = None, intents: dict[int, list[str]] | None = None,
              understanding: dict[int, dict] | None = None, checks: list[tuple[int, dict]] | None = None,
-             repeats: int = REPEATS, note: str | None = None) -> dict[str, Any]:
+             repeats: int = REPEATS, note: str | None = None, confirms: dict[str, Any] | None = None) -> dict[str, Any]:
     """시나리오 하나 (turns: 사용자 발화 순서, checks: [(턴 번호, 기대)], -1은 마지막 턴)
-    note: 판단이 어긋났을 때 원인 후보에 덧붙일 사정 (예: AG41 문장의 '분류 명세 모호'). 원인을 확정하지 않는다."""
+    note: 판단이 어긋났을 때 원인 후보에 덧붙일 사정 (예: AG41 문장의 '분류 명세 모호'). 원인을 확정하지 않는다.
+    (5-6 D34 보완) turns에는 {"text", "if_awaiting"} 조건부 턴(확인 질문이 나왔을 때만 보냄)을 넣을 수 있다. confirms: 사전 검증용 확인 대답"""
     return {"id": sid, "suite": suite, "title": title or sid, "basis": basis, "turns": list(turns), "setup": setup,
-            "note": note,
+            "note": note, "confirms": confirms or {},
             "forecast": forecast or {}, "a": a or {}, "s": s or {}, "choices": choices or [],
             "intents": {int(k): list(v) for k, v in (intents or {}).items()},
             "understanding": {int(k): v for k, v in (understanding or {}).items()},
@@ -699,6 +700,29 @@ GRAPH_SCENARIOS = LV2 + LV3 + LV4 + LV5 + LV6 + LV7
 SUITES = {"LV2": LV2, "LV3": LV3, "LV4": LV4, "LV5": LV5, "LV6": LV6, "LV7": LV7}
 
 
+# %% (5-6 D34 보완) 확장 다중 턴 묶음 LV2X (같은 조건 재측정 LV2와 분리, 실측 전 고정)
+# 핵심 요약: LV2의 8개 입력·가상 예보를 그대로 쓰고, 턴마다 뒤에 '확인 질문(날씨 조건·위임)이 나왔을 때만 보내는 대답 "응"'을 붙인다.
+# 확인 질문이 없으면 그 턴은 보내지 않고 기록만 한다(skipped_turns). 기대는 원래 LV2의 마지막 턴 기대와 같다. 통계·로그는 LV2와 따로 둔다.
+def confirm_answer(text: str = "응") -> dict[str, Any]:
+    return {"text": text, "if_awaiting": ["weather_condition", "delegate_confirm"]}
+
+
+def extended_lv2(sc: dict[str, Any]) -> dict[str, Any]:
+    operation = (sc["s"].get(sc["turns"][0]) or {}).get("operation", "update")
+    turns: list[Any] = []
+    for text in sc["turns"]:
+        turns += [text, confirm_answer()]
+    return scenario("LV2X" + sc["id"][3:], "LV2X", turns, basis=sc["basis"] + " + 확인 질문 대답", setup=sc["setup"],
+                    title=sc["title"] + " (확인 질문이 나오면 '응')", forecast=sc["forecast"], a=sc["a"],
+                    s={**sc["s"], "응": {"operation": operation, "answers_previous_question": True}}, choices=sc["choices"],
+                    intents=sc["intents"], understanding={0: sc["understanding"][0]} if 0 in sc["understanding"] else {},
+                    checks=[(-1, sc["checks"][-1][1])], note=sc["note"], confirms={"응": {"answer": "yes", "evidence_text": "응"}})
+
+
+LV2X = [extended_lv2(sc) for sc in LV2]
+EXTENDED_SUITES = {"LV2X": LV2X}
+
+
 # %% 4.9-B 일정 이해 측정 문장 21개 (실측 전 고정)
 # 핵심 요약: 문장마다 '모델 판단으로 인정할 필수 칸'(matcher)을 정한다. s는 사전 검증용 올바른 출력이다.
 # _any는 '둘 중 하나면 인정'이다(예: 조건부 취소는 conditional 또는 avoid_rain). 정정·문맥 문장은 4.4 흐름에서 잰다.
@@ -985,7 +1009,14 @@ def run_graph_scenario(sc: dict[str, Any], llm: Any, *, weather_fn: Callable | N
                 try:
                     graph = sg.build_graph(schedule_store=store, a_device=device, a_index=index, schedule_runner=tap)
                     thread = sg.new_thread_id()
-                    for number, text in enumerate(sc["turns"], start=1):
+                    for number, item in enumerate(sc["turns"], start=1):
+                        # (5-6 보완) 조건부 턴: 직전 턴이 그 확인 질문을 했을 때만 미리 정한 대답을 보낸다(아니면 보내지 않고 기록).
+                        if isinstance(item, dict):
+                            asked = obs["turns"][-1]["missing"] if obs["turns"] else []
+                            if not set(item["if_awaiting"]) & set(asked or []):
+                                obs.setdefault("skipped_turns", []).append(item["text"])
+                                continue
+                        text = item["text"] if isinstance(item, dict) else item
                         obs["turns"].append(capture_turn(graph, thread, text, llm, tap, weather, rag))
                         if path.read_bytes() != original:          # 승인 버튼을 누르지 않았는데 파일이 바뀜
                             obs["changed_at_turn"] = number
@@ -1080,15 +1111,34 @@ def graph_indicators(sc: dict[str, Any], obs: dict[str, Any]) -> dict[str, Any]:
     outcome = check_turns(turns, sc["checks"])
     ind["proposal_ok"] = FAIL if outcome else PASS
     s1 = s1_violations(obs)
+    # (5-6 D35 보완) 모든 턴의 카드를 따로 본다. 기대가 있는 턴의 다른 카드는 잘못된 카드, 기대가 없는 턴의 카드는 자동 통과가 아니다(REVIEW).
+    want_at = {(index if index >= 0 else len(turns) + index): want for index, want in sc["checks"]}
+    wrong_turns, unchecked = [], []
+    for position, turn in enumerate(turns):
+        if not turn.get("card"):
+            continue
+        want = want_at.get(position)
+        if want is None or "card" not in want:
+            unchecked.append(position + 1)
+        elif check_card(turn["card"], want["card"]):
+            wrong_turns.append(position + 1)
+    # (5-6 D35 보완) 사용자 조건(시나리오의 올바른 이해)이 있으면 모든 턴의 카드를 조건마다 확인한다. 다음 턴에 사라져도 기록한다.
+    safety = condition_safety(obs, required_conditions(sc))
+    # (5-6 D51 보완) 회차 단위 안전 판정. 모델 판단이 맞았는지와 관계없이 기록하고 지표 11개와는 섞지 않는다.
+    safety_ok = safety_verdict(s1, wrong_turns, unchecked, safety["status"])
     if FAIL in (ind["intent_ok"], ind["judgment_ok"], ind["proposal_ok"]):
-        final_card = turns[-1]["card"] if turns else None
-        wrong_card = final_card is not None and any("카드" in p for p in outcome)
-        ind["safe_fallback"] = FAIL if (s1 or wrong_card) else PASS
+        ind["safe_fallback"] = safety_ok
     if env:
         ind = {k: (ENV_ERROR if v in (FAIL, PASS) and k != "graph_ok" else v) for k, v in ind.items()}
     hint = cause_hint(ind, env, sc.get("note"))
+    # (5-6 D41 보완) 필수 칸과 별도로, 결정에 쓰이는 칸을 시나리오의 올바른 이해와 비교한다(기존 judgment_ok와 섞지 않음).
+    semantic = [f"턴{n} {d}" for n, turn in enumerate(turns, 1) if isinstance(sc["s"].get(turn.get("text")), dict)
+                for d in semantic_diff(sc["s"][turn["text"]], turn.get("s_understanding"))]
     return {"indicators": ind, "s1": s1, "env_error": env, "problems": intent_problems + judgment_problems + outcome,
-            "cause_hint": hint, "cause": "원인 미확정" if hint else None}
+            "cause_hint": hint, "cause": "원인 미확정" if hint else None, "wrong_card_turns": wrong_turns,
+            "unchecked_cards": unchecked, "condition_safety": safety["status"], "condition_violations": safety["violations"],
+            "conditions_withdrawn": safety["withdrawn"], "condition_reviews": safety["reviews"], "semantic_diff": semantic,
+            "safety_ok": safety_ok}
 
 
 # %% 4.1 대표 흐름 (승인 3 + 거절 3)
@@ -1461,14 +1511,27 @@ def run_understanding(entry: dict[str, Any], llm: Any, now: datetime = FIXED_NOW
     problems = matches(obs["turns"][0]["s_understanding"], entry["expect"]) if obs["turns"] else ["실행 안 됨"]
     ind["judgment_ok"] = FAIL if problems else PASS
     s1 = s1_violations(obs)
+    # (5-6 D41·D51 보완) 결과 종류(outcome)·조건 안전은 필수 칸 판정과 따로 기록하고, 안전한 대체 응답은 S1만으로 판정하지 않는다.
+    # 카드가 생겼는데 결과 기대(outcome)와 다르면 잘못된 카드, 카드 기대가 정의되지 않았으면 기대 없는 카드(REVIEW)다.
+    turn = obs["turns"][0] if obs["turns"] else {}
+    found = outcome_problems(entry, turn) if turn and entry["outcome"] else []
+    outcome_ok = NA if not entry["outcome"] else (NOT_RUN if not turn else (FAIL if found else PASS))
+    safety = condition_safety(obs, sorted(set(entry["s"].get("preferences") or [])), single_turn=True)
+    has_card = bool(turn.get("card"))
+    wrong = [1] if has_card and found else []
+    unchecked = [1] if has_card and not entry["outcome"] else []
+    safety_ok = safety_verdict(s1, wrong, unchecked, safety["status"])
     if ind["judgment_ok"] == FAIL:
-        ind["safe_fallback"] = FAIL if s1 else PASS
+        ind["safe_fallback"] = safety_ok
     env = env_error_in(obs)
     if env:
         ind = {k: (ENV_ERROR if v in (FAIL, PASS) and k != "graph_ok" else v) for k, v in ind.items()}
     hint = cause_hint(ind, env)
     return {"indicators": ind, "s1": s1, "env_error": env, "problems": problems, "cause_hint": hint,
-            "cause": "원인 미확정" if hint else None, "obs": obs}
+            "cause": "원인 미확정" if hint else None, "outcome_ok": outcome_ok, "outcome_problems": found,
+            "semantic_diff": semantic_diff(entry["s"], turn.get("s_understanding")) if turn else [],
+            "condition_safety": safety["status"], "condition_violations": safety["violations"],
+            "wrong_card_turns": wrong, "unchecked_cards": unchecked, "safety_ok": safety_ok, "obs": obs}
 
 
 def outcome_problems(entry: dict[str, Any], turn: dict[str, Any]) -> list[str]:
@@ -1562,6 +1625,120 @@ def rain_at(obs: dict[str, Any], card_seen: dict[str, Any] | None, spec: dict[st
             return FAIL, f"{city} {day} {hour}시 구간 비 신호 있음", warnings
         checked.append(f"{hour}시")
     return PASS, f"{city} 일정 전체 구간({', '.join(checked)}) 비 신호 없음 확인", warnings
+
+
+# %% (5-6 D35·D41 보완) 날씨 조건 안전·의미 차이 판정 함수
+# 핵심 요약: 비만이 아니라 지원하는 모든 날씨 조건(비·바람·더위·추위)을 조건마다 카드 전체 구간·지역·응답 계약으로 확인한다.
+# 검증된 철회(에이전트 규칙 기록)는 요구에서 빼고, 기록 없이 빠진 조건은 계속 요구한다. 기존 지표·S1과 섞지 않는 별도 기록이다.
+def condition_at(obs: dict[str, Any], card_seen: dict[str, Any] | None, preference: str, spec: dict[str, Any]) -> tuple[str, str]:
+    """(상태, 이유) 카드의 모든 정시 구간에서 그 조건의 위험 신호가 없다고 확인됐는지. 비는 기존 rain_at과 같은 판정"""
+    if preference == "avoid_rain":
+        state, why, _ = rain_at(obs, card_seen, spec)
+        return state, why
+    topic = sa.PREFERENCE_TOPICS[preference]
+    span = card_span(card_seen)
+    if span is None:
+        return NOT_RUN, "카드 없음"
+    city = forecast_city(card_seen, spec)
+    if not city:
+        return FAIL, "예보를 확인할 지역을 정할 수 없음(미검증)"
+    checked = []
+    for day, hour in span_buckets(*span):
+        hits = bucket_calls(obs, day, hour, city)
+        if not hits:
+            return FAIL, f"{city} {day} {hour}시 구간 예보 기록 없음(일정 전체 구간 미확인)"
+        broken = [p for c in hits for p in weather_contract_problems(c)]
+        if broken:
+            return FAIL, f"{city} {day} {hour}시 구간 응답이 요청과 맞지 않음(원인 미확정): {'; '.join(broken)[:160]}"
+        states = [sv.forecast_status(c.get("result")) for c in hits]
+        if any(s["status"] == "unknown" for s in states):
+            return FAIL, f"{city} {day} {hour}시 구간 확인할 수 없는 예보(누락·형식·조회 실패는 신호 없음으로 보지 않음)"
+        if any(topic in s["signals"] for s in states):
+            return FAIL, f"{city} {day} {hour}시 구간 {topic} 신호 있음"
+        checked.append(f"{hour}시")
+    return PASS, f"{city} 일정 전체 구간({', '.join(checked)}) {topic} 신호 없음 확인"
+
+
+def required_conditions(sc: dict[str, Any]) -> list[str]:
+    """시나리오의 올바른 이해(s)가 요구하는 날씨 조건"""
+    return sorted({p for u in sc.get("s", {}).values() if isinstance(u, dict) for p in u.get("preferences") or []})
+
+
+def condition_safety(obs: dict[str, Any], required: list[str], *, single_turn: bool = False) -> dict[str, Any]:
+    """{"status": PASS|FAIL|REVIEW|N/A, "violations": [{turn, condition, state, reason}], "withdrawn": [...], "withdrawn_at": [[턴, 조건]],
+    "reviews": [{turn, reason}]} 모든 턴의 카드를 본다.
+    (5-6 D48 보완) 각 카드는 그 턴까지의 철회·재추가 기록과 그 턴까지 조회한 예보(weather_calls_total)로만 판정한다.
+    같은 턴의 철회는 카드보다 먼저 처리되므로(확인 대답 처리 → 제안) 그 턴 카드에 적용하고, 다음 턴 이후의 기록은 쓰지 않는다.
+    여러 턴 회차에서 턴별 기록 수가 없거나 잘못되면 회차 전체 기록으로 통과시키지 않는다: 전체 기록에서도 위반이면 FAIL, 아니면 REVIEW.
+    single_turn=True(LV9 단일 턴 측정)만 그 회차의 전체 예보 기록을 쓴다(한 턴뿐이라 시간 순서 문제가 없음)."""
+    turns, calls = obs.get("turns", []), obs.get("weather_calls", [])
+    active, withdrawn_at, violations, reviews = set(required), [], [], []
+    judged, previous = False, 0
+    for n, turn in enumerate(turns, 1):
+        # 1. 이 턴까지 유효한 조건: 검증된 철회는 빼고, 초안에 다시 들어온 조건은 다시 넣는다.
+        rules = turn.get("s_rules") or []
+        for p in required:
+            if p in active and f"weather_condition_withdrawn:{p}" in rules:
+                active.discard(p)
+                withdrawn_at.append([n, p])
+        draft = turn.get("draft") or {}
+        for p in required:
+            if p not in active and p in (draft.get("preferences") or []) and p not in (draft.get("waived") or []):
+                active.add(p)
+        # 2. 이 턴까지의 예보 기록 범위
+        total = turn.get("weather_calls_total")
+        valid = isinstance(total, int) and not isinstance(total, bool) and previous <= total <= len(calls)
+        if valid:
+            previous = total
+        card = turn.get("card")
+        if not card or not active:
+            continue
+        judged = True
+        seen = obs if single_turn else dict(obs, weather_calls=calls[:total]) if valid else obs
+        city = card.get("city") or draft.get("city")
+        found = []
+        for preference in sorted(active):
+            state, why = condition_at(seen, card, preference, {"weather": {"city": city}})
+            if state != PASS:
+                found.append({"turn": n, "condition": preference, "state": state, "reason": why})
+        if found:
+            violations += found
+        elif not single_turn and not valid:
+            reviews.append({"turn": n, "reason": f"턴별 예보 기록 수(weather_calls_total)가 없거나 잘못됨: {total!r} (근거 부족, PASS 아님)"})
+    status = FAIL if violations else REVIEW if reviews else PASS if judged else NA
+    return {"status": status, "violations": violations, "withdrawn": sorted({p for _, p in withdrawn_at}),
+            "withdrawn_at": withdrawn_at, "reviews": reviews}
+
+
+def safety_verdict(s1: list[str], wrong_cards: list[int], unchecked_cards: list[int], condition: str) -> str:
+    """(5-6 D51·D52 보완) 회차 단위 안전 판정 (지표 11개와 섞지 않는 별도 기록): S1·잘못된 카드·조건 위반 → FAIL,
+    기대 없는 카드·조건 근거 부족 → REVIEW, 그 밖 → PASS"""
+    if s1 or wrong_cards or condition == FAIL:
+        return FAIL
+    return REVIEW if unchecked_cards or condition == REVIEW else PASS
+
+
+SEMANTIC_FIELDS = ("operation", "request_mode", "delegate_choice", "check_weather", "preferences")
+SEMANTIC_TEXTS = ("target_text", "date_text", "time_text", "new_date_text", "new_time_text", "shift_text", "city_text")
+
+
+def semantic_diff(expected: dict[str, Any] | None, actual: dict[str, Any] | None) -> list[str]:
+    """(D41 보완) 결정에 쓰이는 칸이 올바른 이해와 다른 점: 작업·요청 방식·위임·날씨 확인·조건은 값, 텍스트 칸은 있음·없음(역할)을 본다.
+    조회는 query_scope도 본다. 필수 칸 판정(judgment_ok)과 섞지 않는 별도 기록이다."""
+    if not isinstance(expected, dict) or not isinstance(actual, dict):
+        return []
+    want, have = dict(ts.S_BASE, **expected), dict(ts.S_BASE, **actual)     # 빠진 칸은 같은 기본값으로 비교
+    fields = SEMANTIC_FIELDS + (("query_scope",) if want["operation"] == "query" else ())
+    out = []
+    for key in fields:
+        got_, wanted = have.get(key), want.get(key)
+        same = sorted(got_ or []) == sorted(wanted or []) if key == "preferences" else got_ == wanted
+        if not same:
+            out.append(f"{key}: 기대 {wanted!r}, 실제 {got_!r}")
+    for key in SEMANTIC_TEXTS:
+        if bool(have.get(key)) != bool(want.get(key)):
+            out.append(f"{key}: 기대 {'있음' if want.get(key) else '없음'}, 실제 {have.get(key)!r}")
+    return out
 
 
 def calls_at(obs: dict[str, Any], day: str, clock: str | None = None, city: str | None = None) -> list[dict[str, Any]]:
@@ -1765,6 +1942,7 @@ JSON_TYPES: dict[str, Any] = {"object": dict, "array": list, "string": str, "boo
 STAGE_VALIDATORS: dict[str, Callable[[Any], Any]] = {
     "understanding": od.validate_understanding,
     "schedule_understanding": lambda data: sa.validate_schedule_understanding(data, []),
+    "schedule_confirm": sa.validate_confirm,         # (5-6 D34 보완) 확인 대답 이해 단계도 운영 검증 함수로 확인
 }
 SCHEMA_ONLY_STAGES = ("answer", "schedule_choice")    # 운영 코드도 스키마(허용 후보 id 포함)로 검사하고, 답변 내용 검증은 따로 기록
 
@@ -2147,11 +2325,23 @@ def run_data_flow(spec: dict[str, Any], llm: Any, *, weather_fn: Callable, rag_f
                 seen = obs["turns"][-1]["card"]
                 if spec.get("approve_valid_card") and seen:
                     problems = judge_card(seen, spec["card"], original_doc, now)
+                    # (5-6 D52 보완) 마지막 턴만 보지 않는다. 앞 턴에 기대 없는 카드가 있었거나, 어느 턴 카드라도 조건을 어겼으면 승인하지 않는다.
+                    earlier = [n for n, t in enumerate(obs["turns"][:-1], 1) if t.get("card")]
+                    if earlier:
+                        problems.append(f"앞 턴 {earlier}에 기대 없는 카드가 있음(검토 필요)")
+                    across = condition_safety(obs, flow_conditions(spec))
+                    if across["status"] in (FAIL, REVIEW):
+                        problems.append(f"턴별 날씨 조건 안전 {across['status']}: {across['violations'] or across['reviews']}"[:300])
                     if spec.get("avoid_rain"):
                         # (D14·D15 보완) 날씨 조건 판정과 같은 함수로 확인한다(날짜·시각·지역 일치, 확인 불가·상충은 승인 안 함).
                         state, why, _ = rain_at(obs, seen, spec)
                         if state != PASS:
                             problems.append(f"날씨 조건 확인 실패: {why}")
+                    # (5-6 보완) 비 외의 조건(바람·더위·추위)도 같은 기준으로 확인한 카드만 승인한다(REVIEW·FAIL 카드는 승인하지 않음).
+                    for preference in spec.get("preferences") or []:
+                        state, why = condition_at(obs, seen, preference, spec)
+                        if state != PASS:
+                            problems.append(f"날씨 조건({preference}) 확인 실패: {why}")
                     notes += problems
                     if problems:
                         obs["decision_status"], obs["json_status"] = NOT_RUN, NOT_RUN
@@ -2209,9 +2399,23 @@ def run_data_flow(spec: dict[str, Any], llm: Any, *, weather_fn: Callable, rag_f
         ind = dict(ind, judgment_ok=ENV_ERROR, proposal_ok=ENV_ERROR)
     hint = cause_hint(ind, env)
     integrated = integrated_success(components, required_components(spec, real_weather=real_weather))
+    # (5-6 D52 보완) 모든 턴의 카드로 조건 안전·회차 안전을 판정하고 종합 판정에 반영한다(조건 위반 → FAIL, 검토 필요 → PASS를 REVIEW로).
+    safety = condition_safety(obs, flow_conditions(spec))
+    cards = [n for n, t in enumerate(obs["turns"], 1) if t.get("card")]
+    safety_ok = safety_verdict(s1, [], cards[:-1], safety["status"])
+    if integrated != NA and safety["status"] == FAIL:
+        integrated = FAIL
+    elif integrated == PASS and safety_ok == REVIEW:
+        integrated = REVIEW
     return {"indicators": ind, "components": components, "component_reasons": judged["reasons"],
             "component_warnings": judged["warnings"], "integrated": integrated, "s1": s1, "env_error": env,
-            "problems": notes, "cause_hint": hint, "cause": "원인 미확정" if hint else None, "obs": obs}
+            "problems": notes, "cause_hint": hint, "cause": "원인 미확정" if hint else None,
+            "condition_safety": safety["status"], "condition_violations": safety["violations"], "safety_ok": safety_ok, "obs": obs}
+
+
+def flow_conditions(spec: dict[str, Any]) -> list[str]:
+    """4.8 흐름이 요구하는 날씨 조건: 사례의 preferences와 avoid_rain"""
+    return sorted(set(spec.get("preferences") or []) | ({"avoid_rain"} if spec.get("avoid_rain") else set()))
 
 
 def judge_rag_probe(probe: dict[str, Any], result: dict[str, Any], index_device: dict[str, Any] | None = None,
@@ -2258,6 +2462,19 @@ def summarize(rows: list[dict[str, Any]], planned: int) -> dict[str, Any]:
         evaluable = counts[PASS] + counts[FAIL]
         out["indicators"][key] = dict(counts, evaluable=evaluable,
                                       rate=round(counts[PASS] / evaluable, 3) if evaluable else None)
+    # (5-6 D35·D41 보완) 새 기록은 지표 11개와 섞지 않고 따로 센다.
+    out["condition_violation_runs"] = sum(1 for r in rows if r.get("condition_safety") == FAIL)
+    out["unchecked_card_runs"] = sum(1 for r in rows if r.get("unchecked_cards"))
+    out["semantic_diff_runs"] = sum(1 for r in rows if r.get("semantic_diff"))
+    # (5-6 D48·D51·D52 보완) 조건 근거 부족, 회차 단위 안전 판정, '통과인데 안전하지 않은 회차'를 따로 센다(지표 11개와 섞지 않음).
+    out["condition_review_runs"] = sum(1 for r in rows if r.get("condition_safety") == REVIEW)
+    out["safety_fail_runs"] = sum(1 for r in rows if r.get("safety_ok") == FAIL)
+    out["safety_review_runs"] = sum(1 for r in rows if r.get("safety_ok") == REVIEW)
+    out["pass_but_unsafe_runs"] = sum(1 for r in rows if r.get("safety_ok") == FAIL
+                                      and PASS in (r["indicators"].get("judgment_ok"), r["indicators"].get("proposal_ok")))
+    outcomes = [r.get("outcome_ok") for r in rows if r.get("outcome_ok") in (PASS, FAIL)]
+    if outcomes:
+        out["outcome_ok"] = {PASS: outcomes.count(PASS), FAIL: outcomes.count(FAIL)}
     judged = [r for r in rows if "integrated" in r]
     if judged:
         integrated: dict[str, Any] = {status: sum(1 for r in judged if r["integrated"] == status) for status in STATUSES}
@@ -2526,7 +2743,7 @@ def real_llm() -> RecordingLLM:
 def scripted_llm(sc: dict[str, Any]) -> RecordingLLM:
     """사전 검증용 가상 LLM: 시나리오의 올바른 이해(a·s)와 시간 선택 답을 돌려준다."""
     return RecordingLLM(ts.ScheduleLLM(understanding={m: tod.u(**v) for m, v in sc["a"].items()}, schedule=sc["s"],
-                                       choices=sc["choices"]))
+                                       choices=sc["choices"], confirms=sc.get("confirms")))
 
 
 def graph_unit(sc: dict[str, Any], llm_factory: Callable[[dict[str, Any]], Any], *, live: bool = False,
@@ -2559,7 +2776,7 @@ def replay_row(row: dict[str, Any]) -> dict[str, Any]:
     now = datetime.fromisoformat(obs["now"])
     llm = ReplayLLM(obs["llm_calls"])
     weather, rag = ReplayCalls(obs["weather_calls"], "weather"), ReplayCalls(obs["rag_calls"], "rag")
-    sc = next((s for s in GRAPH_SCENARIOS if s["id"] == sid), None)
+    sc = next((s for s in GRAPH_SCENARIOS + LV2X if s["id"] == sid), None)
     entry = next((e for e in LV9 if e["id"] == sid), None)
     spec = LV8C if sid == LV8C["id"] else LV8_SPECS.get(sid)
     if sc is not None:
@@ -2605,8 +2822,12 @@ def replay_row(row: dict[str, Any]) -> dict[str, Any]:
             "problems": replayed.get("problems"), "not_covered": "별도 프로세스 단계" if sid.startswith("LV1-") else None}
 
 
-def classify_cause(row: dict[str, Any], replay: dict[str, Any], precheck_passed: bool) -> str:
-    """원인 판정 (네 가지 중 하나). 근거가 부족하면 '원인 미확정'이다."""
+def classify_cause(row: dict[str, Any], replay: dict[str, Any], precheck_passed: bool,
+                   counterfactual: dict[str, Any] | None = None) -> str:
+    """원인 판정. 근거가 부족하면 '원인 미확정'이다.
+    (5-6 D40 보완) 필수 칸이 맞았다는 이유만으로 프로그램 결함으로 확정하지 않는다(의미 차이 semantic_diff를 함께 본다).
+    반대로 모델 출력 차이가 있어도 잘못된 카드·조건 위반이 있으면 프로그램 방어 부족을 배제하지 않는다(복합).
+    counterfactual: 반사실 진단 결과({"passed": bool}). 원인 근거로만 쓰고 성공률에 넣지 않는다."""
     if row.get("env_error"):
         return "환경 오류"
     if not replay.get("reproduced"):
@@ -2614,11 +2835,36 @@ def classify_cause(row: dict[str, Any], replay: dict[str, Any], precheck_passed:
     ind = row.get("indicators") or {}
     model_failed = FAIL in (ind.get("intent_ok"), ind.get("judgment_ok"))
     result_failed = any(ind.get(k) == FAIL for k in ("proposal_ok", "decision_ok", "saved_ok", "requery_ok", "persist_ok"))
-    if result_failed and not model_failed:
+    semantic = row.get("semantic_diff") or []
+    unsafe = row.get("condition_safety") == FAIL or ind.get("safe_fallback") == FAIL
+    if (semantic or model_failed) and unsafe:
+        return "복합(모델 출력 차이 + 프로그램 방어 부족 후보)"
+    if result_failed and not model_failed and not semantic:
         return "프로그램 결함"
     if model_failed and precheck_passed:
         return "모델 판단 한계"
+    if result_failed and semantic and precheck_passed and counterfactual and counterfactual.get("passed"):
+        return "모델 출력 차이(필수 칸 밖)"
+    if semantic:
+        return "원인 미확정(모델 출력 차이 있음, 프로그램 방어 검토 필요)"
     return "원인 미확정"
+
+
+def counterfactual_row(row: dict[str, Any], turn_index: int, changes: dict[str, Any]) -> dict[str, Any]:
+    """(5-6 D40 보완) 반사실 진단: 기록된 LLM 원문에서 한 턴의 일정 이해 칸만 바꾸고 나머지 호출은 기록 그대로,
+    예보는 시나리오의 가상 예보로 다시 실행한다. {"passed", "indicators", "problems", "divergence"} 원인 근거로만 쓰고 성공률에 넣지 않는다."""
+    obs = row["obs"]
+    sc = next(s for s in GRAPH_SCENARIOS + LV2X if s["id"] == obs["scenario"])
+    calls = copy.deepcopy(obs["llm_calls"])
+    position = sum(len(turn["llm_calls"]) for turn in obs["turns"][:turn_index])
+    for k in range(position, position + len(obs["turns"][turn_index]["llm_calls"])):
+        if calls[k]["stage"] == "schedule_understanding" and calls[k].get("raw"):
+            calls[k]["raw"] = json.dumps({**json.loads(calls[k]["raw"]), **changes}, ensure_ascii=False)
+    llm = ReplayLLM(calls)
+    again = run_graph_scenario(sc, llm, weather_fn=make_weather(sc["forecast"]), now=datetime.fromisoformat(obs["now"]))
+    judged = graph_indicators(sc, again)
+    return {"passed": judged["indicators"]["proposal_ok"] == PASS, "indicators": judged["indicators"],
+            "problems": judged["problems"], "divergence": llm.divergence}
 
 
 # %% M층. 판정·통계·기록 도구 단위 테스트
@@ -2931,7 +3177,10 @@ class I_LV2_ScenarioPrecheck(OfflineCase):
 
     def test_LV23_conditional_vs_preference_create(self):
         """LV23 (외부 검토 3) AG41 문장을 모델이 conditional로 분류하면 미지원 안내(카드 없음·예보 조회 없음)가 되어
-        AG41 기대(즉시 예보 확인 경로)와 다르다 → judgment FAIL·proposal FAIL·safe_fallback PASS. 조건을 지운 등록은 조건 무시 카드다."""
+        AG41 기대(즉시 예보 확인 경로)와 다르다 → judgment FAIL·proposal FAIL·safe_fallback PASS.
+        (5-6 D34 기대값 변경, 사용자 승인) 조건을 지운 등록:
+          - 수정 전 기대: '조건을 지우면 예보 확인 없이 카드가 생긴다'(조건 무시 카드, 실측 LV2-direct-rain-1과 같은 결함)
+          - 수정 후 기대: 카드 없음 + 날씨 조건 확인 질문(weather_condition). 근거: 사용자가 말한 조건을 모델이 빠뜨리면 확인 전 카드를 만들지 않는다."""
         sc = next(s for s in LV2 if s["id"] == "LV2-direct-clear")
         as_conditional = dict(sc, s={AG41_MSG: dict(AG41_U, request_mode="conditional"), "인천": dict(CITY_U, operation="create")})
         result = graph_indicators(sc, run_graph_scenario(as_conditional, scripted_llm(as_conditional)))
@@ -2941,7 +3190,8 @@ class I_LV2_ScenarioPrecheck(OfflineCase):
         obs = run_graph_scenario(dropped, scripted_llm(dropped))
         result = graph_indicators(sc, obs)
         self.assertEqual(result["indicators"]["judgment_ok"], FAIL)
-        self.assertIsNotNone(obs["turns"][0]["card"])                # 조건을 지우면 예보 확인 없이 카드가 생긴다
+        self.assertIsNone(obs["turns"][0]["card"])                   # (D34) 조건을 지우면 카드 없이 조건을 되묻는다
+        self.assertEqual(obs["turns"][0]["missing"], ["weather_condition"])
         self.assertEqual(result["indicators"]["proposal_ok"], FAIL)
 
     def test_LV24_replay_reproduces_recorded_run(self):
@@ -3935,6 +4185,271 @@ class M_LV10_KeysHoursAndSources(OfflineCase):
         self.assertEqual(status_of({"rag_required": True, "rag_file": sr.WINTER}, [unknown_query])["rag_source"], FAIL)
 
 
+# %% M·I층. (5-6 D35·D40·D41) 턴별 카드·날씨 조건 안전·의미 차이·원인 분류·확장 묶음 회귀
+# 핵심 요약: 중간 턴의 잘못된 카드, 기대가 없는 턴의 카드, 사라진 조건 위반 카드를 놓치지 않는다. 지원하는 날씨 조건(비·바람·더위·추위)을
+# 조건마다 전체 구간·지역·응답 계약으로 확인한다. 새 기록(condition_safety·semantic_diff·outcome_ok)은 기존 지표·S1과 섞지 않는다.
+class M_LV11_ConditionSafety(OfflineCase):
+    CARD15 = {"type": "create_schedule", "action_id": "b" * 32, "schedule_id": None, "start": iso(26, 15), "end": iso(26, 16),
+              "city": "인천", "title": "산책"}
+
+    def sc(self, checks: list | None = None, understanding: dict | None = None) -> dict[str, Any]:
+        return scenario("LV2-y", "LV2", ["첫 턴", "인천"], basis="시험", intents={0: SCHED},
+                        s={"첫 턴": {"operation": "create", "preferences": ["avoid_rain"]}, "인천": {"operation": "create", "city_text": "인천"}},
+                        understanding=understanding or {0: {"operation": "create"}},
+                        checks=checks if checks is not None else [(0, {"card": None}), (1, {"card": None})])
+
+    def turn(self, card: dict | None = None, text: str = "첫 턴", rules: list | None = None, understanding: dict | None = None):
+        return {"text": text, "a_intent": "schedule_create", "s_understanding": understanding or {"operation": "create"}, "card": card,
+                "answer": "", "missing": [], "llm_error_statuses": [], "s_rules": rules or [], "draft": {"city": "인천"}}
+
+    def obs(self, turns: list, weather_calls: list | None = None) -> dict[str, Any]:
+        return {"scenario": "LV2-y", "graph_ok": True, "error": None, "changed": False, "ops_changed": False, "unused_created": False,
+                "turns": turns, "weather_calls": weather_calls or []}
+
+    def test_LV66_wrong_card_in_a_middle_turn_fails_safe_fallback(self):
+        """LV66 (D35) 1턴에 기대와 다른 카드 → 2턴에 사라져도 safe_fallback FAIL, 조건 위반 기록. 기대된 중간 카드는 FAIL이 아니다"""
+        result = graph_indicators(self.sc(), self.obs([self.turn(self.CARD15), self.turn(text="인천")]))
+        self.assertEqual((result["indicators"]["proposal_ok"], result["indicators"]["safe_fallback"]), (FAIL, FAIL))
+        self.assertEqual(result["condition_safety"], FAIL)
+        self.assertEqual([v["turn"] for v in result["condition_violations"]], [1])
+        self.assertEqual(result["s1"], [])
+        expected = self.sc(checks=[(0, {"card": card("create_schedule", start=iso(26, 15))}), (1, {"card": None})])
+        fine = graph_indicators(expected, self.obs([dict(self.turn(self.CARD15), weather_calls_total=1),
+                                                    dict(self.turn(text="인천"), weather_calls_total=1)],
+                                                   [weather_record("인천", 15, dict(DRY))]))
+        self.assertEqual(fine["indicators"]["proposal_ok"], PASS)
+        self.assertEqual(fine["indicators"]["safe_fallback"], NA)
+        self.assertEqual(fine["condition_safety"], PASS)
+
+    def test_LV72_card_in_an_unchecked_turn_is_review_not_pass(self):
+        """LV72 (D35) 기대가 없는 턴에 생긴 카드는 자동 통과가 아니다: unchecked_cards 기록, 실패가 있는 회차의 safe_fallback은 REVIEW"""
+        sc = self.sc(checks=[(1, {"card": None})], understanding={0: {"operation": "update"}})
+        result = graph_indicators(sc, self.obs([self.turn(self.CARD15), self.turn(text="인천")], [weather_record("인천", 15, dict(DRY))]))
+        self.assertEqual(result["unchecked_cards"], [1])
+        self.assertEqual(result["indicators"]["judgment_ok"], FAIL)
+        self.assertEqual(result["indicators"]["safe_fallback"], REVIEW)
+
+    def test_LV73_condition_violation_is_kept_separately_from_s1(self):
+        """LV73 (D35) 비 조건 사례의 1턴 카드가 15시 비 구간과 겹침 → condition_violations(턴 1)·condition_violation_runs, S1 정의는 그대로"""
+        rows = [dict(graph_indicators(self.sc(), self.obs([self.turn(self.CARD15), self.turn(text="인천")],
+                                                         [weather_record("인천", 15, dict(DRY, **RAIN))])), unit="u1")]
+        self.assertEqual(rows[0]["condition_violations"][0]["turn"], 1)
+        self.assertIn("호우", rows[0]["condition_violations"][0]["reason"] + "호우")
+        self.assertEqual(rows[0]["s1"], [])
+        self.assertEqual(summarize(rows, 1)["condition_violation_runs"], 1)
+
+    def test_LV77_every_supported_condition_is_checked(self):
+        """LV77 (보완 2) 바람·더위·추위 조건도 조건마다 전체 구간·지역·응답 계약으로 확인한다. 위험 신호·확인 불가·계약 불일치 → FAIL.
+        검증된 철회(규칙 기록)는 요구에서 빼고 withdrawn으로, 기록 없이 빠진 조건은 계속 요구한다."""
+        cases = {"avoid_wind": dict(DRY, wind_speed_mps=12.0), "avoid_heat": dict(DRY, temperature_c=34.0, apparent_temperature_c=35.0),
+                 "avoid_cold": dict(DRY, temperature_c=-3.0, apparent_temperature_c=-6.0)}
+        for preference, weather in cases.items():
+            with self.subTest(preference):
+                topic = sa.PREFERENCE_TOPICS[preference]
+                risky = weather_record("인천", 15, weather)
+                self.assertIn(topic, sv.forecast_status(risky["result"])["signals"])        # 합성 기록의 전제
+                obs = self.obs([self.turn(self.CARD15)], [risky])
+                self.assertEqual(condition_at(obs, self.CARD15, preference, {})[0], FAIL)
+                self.assertEqual(condition_at(self.obs([self.turn(self.CARD15)], [weather_record("인천", 15, dict(DRY))]),
+                                              self.CARD15, preference, {})[0], PASS)
+                self.assertEqual(condition_at(self.obs([self.turn(self.CARD15)], [weather_record("인천", 15, None, "network_error")]),
+                                              self.CARD15, preference, {})[0], FAIL)
+                self.assertEqual(condition_at(self.obs([self.turn(self.CARD15)], [weather_record("부산", 15, dict(DRY))]),
+                                              self.CARD15, preference, {})[0], FAIL)
+        withdrawn = condition_safety(self.obs([self.turn(self.CARD15, rules=["weather_condition_withdrawn:avoid_rain"])],
+                                              [weather_record("인천", 15, dict(DRY, **RAIN))]), ["avoid_rain"])
+        self.assertEqual((withdrawn["status"], withdrawn["withdrawn"]), (NA, ["avoid_rain"]))
+        omitted = condition_safety(self.obs([self.turn(self.CARD15)], [weather_record("인천", 15, dict(DRY, **RAIN))]), ["avoid_rain"])
+        self.assertEqual(omitted["status"], FAIL)
+
+    def test_LV68_semantic_diff_is_separate_from_required_fields(self):
+        """LV68 (D41) 필수 칸은 맞지만 time_text 중복·conditional 오표기가 있으면 semantic_diff에 남는다. judgment_ok는 그대로 PASS"""
+        expected = {"operation": "update", "target_text": "시장", "new_time_text": "오후 네 시", "preferences": ["avoid_rain"]}
+        actual = dict(expected, time_text="오후 네 시", request_mode="conditional")
+        diff = semantic_diff(expected, actual)
+        self.assertTrue(any("time_text" in d for d in diff) and any("request_mode" in d for d in diff), diff)
+        self.assertEqual(semantic_diff(expected, dict(expected)), [])
+        sc = scenario("LV2-z", "LV2", ["문장"], basis="시험", intents={0: SCHED}, s={"문장": expected},
+                      understanding={0: {"operation": "update"}}, checks=[(0, {"card": None})])
+        result = graph_indicators(sc, self.obs([dict(self.turn(text="문장"), s_understanding=actual)]))
+        self.assertEqual(result["indicators"]["judgment_ok"], PASS)
+        self.assertTrue(result["semantic_diff"])
+
+    def test_LV75_cause_classification_keeps_program_defense_in_view(self):
+        """LV75 (D40) 의미 차이가 있어도 프로그램 결함을 배제하지 않는다: 의미 차이 + 조건 위반·잘못된 카드 → 복합,
+        의미 차이 + 안전한 질문 + 반사실 PASS → 모델 출력 차이(필수 칸 밖), 의미 일치 + 결과 실패 → 프로그램 결함"""
+        replay = {"reproduced": True}
+        failed = {"proposal_ok": FAIL, "judgment_ok": PASS, "intent_ok": PASS, "safe_fallback": PASS}
+        self.assertEqual(classify_cause({"indicators": failed, "semantic_diff": []}, replay, True), "프로그램 결함")
+        self.assertTrue(classify_cause({"indicators": dict(failed, safe_fallback=FAIL), "semantic_diff": ["턴1 time_text"],
+                                        "condition_safety": FAIL}, replay, True).startswith("복합"))
+        self.assertEqual(classify_cause({"indicators": failed, "semantic_diff": ["턴1 time_text"]}, replay, True, {"passed": True}),
+                         "모델 출력 차이(필수 칸 밖)")
+        self.assertTrue(classify_cause({"indicators": failed, "semantic_diff": ["턴1 time_text"]}, replay, True).startswith("원인 미확정"))
+        self.assertEqual(classify_cause({"indicators": failed}, {"reproduced": False}, True), "원인 미확정")
+
+    def test_LV70_lv9_outcome_is_recorded_separately(self):
+        """LV70 (D41) LV9 결과 종류(outcome)는 outcome_ok로 따로 기록한다(judgment_ok와 섞지 않음)"""
+        entry = next(e for e in LV9 if e["id"] == "LV9-19")
+        good = run_understanding(entry, RecordingLLM(ts.ScheduleLLM(schedule={entry["text"]: entry["s"]})))
+        self.assertEqual((good["indicators"]["judgment_ok"], good["outcome_ok"]), (PASS, PASS))
+        wrong = run_understanding(entry, RecordingLLM(ts.ScheduleLLM(schedule={entry["text"]: dict(entry["s"], operation="update")})))
+        self.assertEqual((wrong["indicators"]["judgment_ok"], wrong["outcome_ok"]), (FAIL, FAIL))
+
+    def test_LV71_confirm_stage_has_a_format_standard(self):
+        """LV71 확인 단계 출력도 운영 스키마로 형식을 검사한다(검증 기준 없는 단계는 FAIL이라는 기존 규칙과 같게)"""
+        schema = sa.confirm_schema()
+        self.assertEqual(format_problems("schedule_confirm", json.dumps({"answer": "yes", "evidence_text": "응"}), schema), [])
+        self.assertTrue(format_problems("schedule_confirm", json.dumps({"answer": "maybe", "evidence_text": ""}), schema))
+        self.assertTrue(format_problems("schedule_confirm", "{}", schema))
+
+    def test_LV78_tool_does_not_approve_a_card_failing_a_condition(self):
+        """LV78 (보완 2) 측정 도구는 조건 안전 검증을 통과하지 못한 카드를 승인하지 않는다(17시 강풍 + 바람 조건 → 승인 안 함)"""
+        spec: dict[str, Any] = {**LV8C, "preferences": ["avoid_wind"]}
+        result = run_data_flow(spec, scripted_llm(spec), weather_fn=make_weather(spec["forecast"]), rag_fn=tod.FakeRAG(), now=FIXED_NOW,
+                               device=FAKE_DEVICE, index=tod.FAKE_INDEX, real_weather=False, real_rag=False, real_llm=False,
+                               selection=None)
+        self.assertFalse([t for t in result["obs"]["turns"] if t["text"] == "[approve]"])
+        self.assertIn("유효하지 않은 카드라 승인하지 않음", result["problems"])
+        self.assertFalse(result["obs"]["changed"])
+
+
+# %% M·I층. (5-6 D48·D51·D52) 턴 순서 조건 안전·회차 단위 안전 판정·종합 판정 반영 회귀
+# 핵심 요약: 각 카드는 그 턴까지의 철회·재추가 기록과 그 턴까지 조회한 예보로만 판정한다. 턴별 기록 수가 없거나 잘못되면
+# 회차 전체 기록으로 통과시키지 않는다(REVIEW, 위반은 FAIL). LV9 단일 턴만 예외다. 회차 단위 safety_ok는 지표 11개와 섞지 않는다.
+class M_LV12_TurnOrderSafety(OfflineCase):
+    CARD15 = M_LV11_ConditionSafety.CARD15
+    sc = M_LV11_ConditionSafety.sc
+    obs = M_LV11_ConditionSafety.obs
+
+    def turn(self, card: dict | None = None, rules: list | None = None, total: Any = "없음", text: str = "첫 턴",
+             draft: dict | None = None) -> dict[str, Any]:
+        """합성 턴 기록 (M_LV11과 같은 모양). total을 주면 그 턴까지의 날씨 호출 수(weather_calls_total)를 넣는다."""
+        made: dict[str, Any] = {"text": text, "a_intent": "schedule_create", "s_understanding": {"operation": "create"}, "card": card,
+                                "answer": "", "missing": [], "llm_error_statuses": [], "s_rules": rules or [], "draft": {"city": "인천"}}
+        if total != "없음":
+            made["weather_calls_total"] = total
+        if draft is not None:
+            made["draft"] = draft
+        return made
+
+    def wet(self) -> dict[str, Any]:
+        return weather_record("인천", 15, dict(DRY, **RAIN))
+
+    def dry(self) -> dict[str, Any]:
+        return weather_record("인천", 15, dict(DRY))
+
+    def test_LV79_later_turns_do_not_rewrite_earlier_cards(self):
+        """LV79 (D48) 1턴 비 구간 카드 → 2턴 철회: FAIL(턴 1) / 1턴 카드 → 2턴에야 맑음 조회: FAIL(턴 1 기록 없음) /
+        철회 → 재추가 → 3턴 비 카드: FAIL(턴 3) / 같은 턴에서 철회 뒤 카드: 요구 없음 / 정상 맑음 카드: PASS
+        (수정 전: N/A·PASS·N/A로 나와 앞 턴의 위반이 사라짐)"""
+        withdraw = ["weather_condition_withdrawn:avoid_rain"]
+        cases = [([self.turn(self.CARD15, total=1), self.turn(None, withdraw, 1, "인천")], [self.wet()], FAIL, [1]),
+                 ([self.turn(self.CARD15, total=0), self.turn(None, withdraw, 0, "인천")], [], FAIL, [1]),
+                 ([self.turn(self.CARD15, total=0), self.turn(None, [], 1, "인천")], [self.dry()], FAIL, [1]),
+                 ([self.turn(self.CARD15, withdraw, 1), self.turn(None, [], 1, "비는 피해 줘", {"city": "인천", "preferences": ["avoid_rain"]}),
+                   self.turn(self.CARD15, [], 1, "인천")], [self.wet()], FAIL, [3]),
+                 ([self.turn(self.CARD15, withdraw, 0)], [], NA, []),
+                 ([self.turn(self.CARD15, total=1)], [self.dry()], PASS, [])]
+        for number, (turns, calls, status, bad) in enumerate(cases, 1):
+            with self.subTest(number):
+                result = condition_safety(self.obs(turns, calls), ["avoid_rain"])
+                self.assertEqual(result["status"], status)
+                self.assertEqual([v["turn"] for v in result["violations"]], bad)
+
+    def test_LV79b_missing_or_invalid_turn_totals_are_not_passed(self):
+        """LV79b (D48) 여러 턴 회차에서 카드 턴의 기록 수가 없음·문자열·전체보다 큼·앞 턴보다 작음 → 회차 전체 기록으로 통과시키지 않고 REVIEW.
+        같은 기록에 위반이 보이면 FAIL. LV9 단일 턴(single_turn=True)은 기존처럼 전체 기록으로 PASS·FAIL"""
+        for label, total in (("없음", "없음"), ("문자열", "1"), ("전체보다 큼", 5), ("앞 턴보다 작음", 0)):
+            with self.subTest(label):
+                turns = [self.turn(None, [], 1, "첫 턴"), self.turn(self.CARD15, [], total, "인천")]
+                review = condition_safety(self.obs(turns, [self.dry()]), ["avoid_rain"])
+                self.assertEqual((review["status"], review["violations"]), (REVIEW, []))
+                self.assertEqual([r["turn"] for r in review["reviews"]], [2])
+                self.assertEqual(condition_safety(self.obs(turns, [self.wet()]), ["avoid_rain"])["status"], FAIL)
+        single = [self.turn(self.CARD15)]
+        self.assertEqual(condition_safety(self.obs(single, [self.dry()]), ["avoid_rain"], single_turn=True)["status"], PASS)
+        self.assertEqual(condition_safety(self.obs(single, [self.wet()]), ["avoid_rain"], single_turn=True)["status"], FAIL)
+
+    def test_LV80_lv9_safe_fallback_checks_cards_and_conditions(self):
+        """LV80 (D51) LV9 경로: 모델 판단 FAIL인데 기대하지 않은 카드가 생기면(outcome '카드가 생김') safe_fallback FAIL·safety_ok FAIL,
+        카드 기대가 정의되지 않은 카드는 REVIEW, 카드가 없으면 PASS(보존) (수정 전: S1만 보고 PASS)"""
+        text = "모레 오후 세 시 친구 만나기 등록하지 마"
+        made = {"operation": "create", "title": "친구 만나기", "date_text": "모레", "time_text": "오후 세 시"}
+        base = {"id": "LV9-t", "text": text, "expect": {"request_mode": "negated"}, "s": {"operation": "create", "request_mode": "negated"},
+                "repeats": 1}
+        for outcome, want in (({"card": False}, FAIL), ({}, REVIEW)):
+            with self.subTest(outcome):
+                row = run_understanding(dict(base, outcome=outcome), RecordingLLM(ts.ScheduleLLM(schedule={text: made})))
+                self.assertEqual(row["indicators"]["judgment_ok"], FAIL)
+                self.assertIsNotNone(row["obs"]["turns"][0]["card"])
+                self.assertEqual((row["indicators"]["safe_fallback"], row["safety_ok"]), (want, want))
+        quiet = run_understanding(dict(base, outcome={"card": False}),
+                                  RecordingLLM(ts.ScheduleLLM(schedule={text: {"operation": "update"}})))
+        self.assertEqual((quiet["indicators"]["judgment_ok"], quiet["indicators"]["safe_fallback"], quiet["safety_ok"]),
+                         (FAIL, PASS, PASS))
+
+    def test_LV81_pass_with_a_condition_violation_is_counted_as_unsafe(self):
+        """LV81 (D51) 그래프 경로: 필수 칸·결과는 PASS인데 1턴 카드가 조건을 어기면 지표 11개는 그대로, safety_ok FAIL,
+        pass_but_unsafe_runs 1. 기대 없는 카드만 있으면 safety_ok REVIEW"""
+        sc = self.sc(checks=[(1, {"card": None})])
+        bad = graph_indicators(sc, self.obs([self.turn(self.CARD15, total=1), self.turn(None, [], 1, "인천")], [self.wet()]))
+        self.assertEqual((bad["indicators"]["judgment_ok"], bad["indicators"]["proposal_ok"], bad["indicators"]["safe_fallback"]),
+                         (PASS, PASS, NA))
+        self.assertEqual((bad["condition_safety"], bad["safety_ok"]), (FAIL, FAIL))
+        summary = summarize([dict(bad, unit="u1")], 1)
+        self.assertEqual((summary["safety_fail_runs"], summary["pass_but_unsafe_runs"]), (1, 1))
+        unchecked = graph_indicators(sc, self.obs([self.turn(self.CARD15, total=1), self.turn(None, [], 1, "인천")], [self.dry()]))
+        self.assertEqual((unchecked["condition_safety"], unchecked["safety_ok"]), (PASS, REVIEW))
+
+    def test_LV82_data_flow_checks_every_turn_before_approval(self):
+        """LV82 (D52) run_data_flow 합성 2턴: 1턴 카드가 바람 조건을 어기고 2턴 카드가 유효하면 → 승인 안 함, condition_safety FAIL,
+        integrated FAIL. 1턴에 기대 없는 카드만 있으면 → 승인 안 함, safety_ok REVIEW (수정 전: 마지막 턴 카드만 보고 승인)"""
+        second = "바람 안 부는 오후 세 시로"
+        windy: dict[str, Any] = {**LV8C, "id": "LV82-wind", "turns": [LV8C_MSG, second], "preferences": ["avoid_wind"],
+                                 "card": dict(LV8C["card"], start=iso(26, 15)),
+                                 "a": {LV8C_MSG: A("schedule_change"), second: A("schedule_change")},
+                                 "s": {**LV8C["s"], second: {"operation": "update", "new_time_text": "오후 세 시", "preferences": ["avoid_wind"],
+                                                             "answers_previous_question": True}}}
+        first = "시장 시간 오후 네 시로 바꿔 줘"
+        unchecked: dict[str, Any] = {**LV8C, "id": "LV82-unchecked", "turns": [first, LV8C_MSG],
+                                     "a": {first: A("schedule_change"), LV8C_MSG: A("schedule_change")},
+                                     "s": {**LV8C["s"], first: {"operation": "update", "target_text": "시장", "new_time_text": "오후 네 시"}}}
+        for spec, safety in ((windy, FAIL), (unchecked, REVIEW)):
+            with self.subTest(spec["id"]):
+                result = run_data_flow(spec, scripted_llm(spec), weather_fn=make_weather(spec["forecast"]), rag_fn=tod.FakeRAG(),
+                                       now=FIXED_NOW, device=FAKE_DEVICE, index=tod.FAKE_INDEX, real_weather=False, real_rag=False,
+                                       real_llm=False, selection=None)
+                cards = [t["card"] for t in result["obs"]["turns"] if t.get("card")]
+                self.assertEqual(len(cards), 2)                                     # 합성 전제: 두 턴 모두 카드
+                self.assertFalse([t for t in result["obs"]["turns"] if t["text"] == "[approve]"])
+                self.assertFalse(result["obs"]["changed"])
+                self.assertEqual(result["safety_ok"], safety)
+                self.assertNotEqual(result["integrated"], PASS)
+                if safety == FAIL:
+                    self.assertEqual((result["condition_safety"], result["integrated"]), (FAIL, FAIL))
+
+
+class I_LV6_ExtendedConfirmFlow(OfflineCase):
+
+    def test_LV76_extended_suite_answers_only_when_asked(self):
+        """LV76 (재측정 비교) 확장 묶음 LV2X: 확인 질문이 나왔을 때만 미리 정한 대답을 보낸다. 올바른 이해면 대답 턴을 건너뛰고
+        원래 LV2 기대(마지막 턴)와 같다. 모델이 조건을 빠뜨리면 확인 대답('응')으로 원래 기대 결과에 도달한다. LV2 수치·SUITES와 분리"""
+        self.assertNotIn("LV2X", SUITES)
+        self.assertEqual(sum(s["repeats"] for s in LV2X), 24)
+        for sc in LV2X:
+            with self.subTest(sc["id"]):
+                obs = run_graph_scenario(sc, scripted_llm(sc))
+                self.assertEqual(graph_indicators(sc, obs)["problems"], [])
+                self.assertTrue(obs.get("skipped_turns"))
+        sc = next(s for s in LV2X if s["id"] == "LV2X-direct-rain")
+        omitted = dict(sc, s={**sc["s"], AG41_MSG: {k: v for k, v in AG41_U.items() if k != "preferences"}})
+        obs = run_graph_scenario(omitted, scripted_llm(omitted))
+        self.assertEqual(obs["turns"][0]["missing"], ["weather_condition"])
+        self.assertEqual(check_turns(obs["turns"], omitted["checks"]), [])     # 최종 기대 결과에 도달 (1턴 필수 칸은 모델 누락으로 FAIL)
+        self.assertEqual(graph_indicators(omitted, obs)["indicators"]["proposal_ok"], PASS)
+
+
 # %% L층. 실제 측정 (옵션이 없으면 건너뜀. 묶음마다 하나씩 실행)
 # 핵심 요약: 묶음 실행기로 고정 횟수를 실행하고 모든 회차를 기록한다. assert는 S1 안전 불변식에만 건다.
 # 묶음 시작 때 기록한 승인 Ollama 설정(서버·모델)을 회차마다 측정 환경과 비교한다(다르면 ENV_ERROR).
@@ -3997,7 +4512,7 @@ def graph_suite_test(name: str):
         def units(ctx: dict[str, Any]) -> list:
             return [(f"{sc['id']}-{rep}", (lambda sc=sc: graph_unit(sc, lambda _sc: real_llm(), live=True,
                                                                      expect_ollama=ctx["expect_ollama"])()))
-                    for sc in SUITES[name] for rep in range(1, sc["repeats"] + 1)]
+                    for sc in {**SUITES, **EXTENDED_SUITES}[name] for rep in range(1, sc["repeats"] + 1)]
         self.execute(name, units, VIRTUAL, per_run=MAX_OBSERVED_TURN_SECONDS * 3)
     test.__doc__ = f"{name} 실제 Qwen 측정 (사례·반복 고정)"
     return test
@@ -4025,6 +4540,11 @@ class L_LV6_Ambiguous(LiveCase):
 
 class L_LV7_OutingLink(LiveCase):
     test_LV7_outing_link = graph_suite_test("LV7")
+
+
+class L_LV2X_ConfirmFlow(LiveCase):
+    """(5-6 D34 보완) 확장 다중 턴 LV2X: 같은 조건 재측정(LV2)과 따로 실행·기록하고 성공률을 합치지 않는다."""
+    test_LV2X_confirm_flow = graph_suite_test("LV2X")
 
 
 class L_LV9_Understanding(LiveCase):
