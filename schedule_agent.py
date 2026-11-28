@@ -358,6 +358,86 @@ CONFIRM_LIMIT = 2              # 최초 질문 + 다시 묻기 1회 (프로젝�
 CONFIRM_ANSWER_LIMIT = 40      # 확인 질문의 대답으로 볼 발화 길이 상한 (프로젝트 설정)
 
 
+# %% (5-6 F1·F2·F3 보완) 작업 종류·지역 표현과 사용자 원문의 불일치 확인
+# 핵심 요약: GPU 종합 검증에서 ① '비 오면 장보기 취소해 줘'를 모델이 변경(update)으로 분류해 위임 확인 → '응' → 이동 카드가 나왔고(F1),
+# ② '공원 걷기'의 '공원'을 지역으로 써서 그 '지역' 예보로 조건을 확인했으며(F2), ③ 되물은 지역의 대답을 확정하지 못했는데도
+# 지역 없이 카드를 만들었다(F3). 키워드로 의도를 분류하지 않고, LLM 출력과 원문이 명확히 어긋날 때만 묻거나 보류한다.
+# - 취소 요청 꼴('취소해·안 갈래')만 본다. '취소돼서'(이유)·'취소하지 마'(부정)·변경 표현이 함께 있는 말은 변경 요청 그대로 둔다.
+# - 지역 이름은 광역시·도 이름만 좁게 본다('세 시'·'친구'·'포도'·'서울대병원'에는 반응하지 않음).
+CANCEL_REQUEST_MARKS = re.compile(r"취소\s*(?:해|할|하고|하자|부탁)|안\s*갈(?:래|게|\s*거)|안\s*가기로")
+CANCEL_BLOCK_MARKS = re.compile(r"취소\s*(?:하지|는\s*말|말고|안\s*해|안\s*할)")
+COMPLETE_MARKS = re.compile(r"완료|끝냈|다녀왔|마쳤")
+UPDATE_MARKS = re.compile(r"바꿔|바꾸|바꿀|옮겨|옮기|미뤄|미루|당겨|당기|늦춰|늦추|변경")
+PROVINCE_NAMES = "경기도|강원도|강원특별자치도|충청북도|충청남도|전라북도|전북특별자치도|전라남도|경상북도|경상남도|제주도|제주특별자치도|제주"
+REGION_WORD = re.compile(rf"(?<![가-힣])({od.METRO_NAMES}|{PROVINCE_NAMES})(?=에서|에|은|는|이|가|으로|로|\s|[,.?!]|$)")
+CITY_REQUIRED = "city_required"     # 초안 pending: 확정해야 할 지역 표현 (사용자가 말한 지역·모호한 지역)
+CITY_TRIES = "city_tries"           # 초안 pending: 지역 질문 횟수 (문자열, 최초 질문 + 다시 묻기 1회)
+
+
+def said_region(message: str) -> str | None:
+    """발화에 낱말로 나온 광역시·도 이름. 없으면 None (작은 시·군 이름은 오탐을 막으려고 보지 않는다)"""
+    match = REGION_WORD.search(message or "")
+    return match.group(1) if match else None
+
+
+def region_marked(city: str) -> bool:
+    """정상 지역 표지가 있는지: 광역시 이름, 시·군·구·도 접미사(세 글자 이상), 도 이름, 1단계 모호 지역표. 두 단어면 하나라도"""
+    for word in re.split(r"[,\s]+", (city or "").strip()):
+        if word and (re.fullmatch(od.METRO_NAMES, word) or (len(word) >= 3 and od.CITY_UNIT.search(word))
+                     or od.PROVINCE_ANSWER.match(word) or word.lower() in AMBIGUOUS_CITY_NAMES):
+            return True
+    return False
+
+
+def drop_name_city(grounded: dict[str, Any], doc: dict[str, Any]) -> tuple[dict[str, Any], list[dict[str, str]]]:
+    """(F2) city_text가 이번 발화의 대상·이름이나 등록된 일정 제목 안의 낱말이고 정상 지역 표지가 없으면 지역으로 쓰지 않는다.
+    (근거가 확인된 이해 결과, 버린 표현 목록) 정상 지역('인천'·'경기도 광주'·'광주광역시')은 이름 안에 있어도 지우지 않는다."""
+    city = grounded.get("city_text") or ""
+    if not city or region_marked(city):
+        return grounded, []
+    key = _squeeze(city)
+    names = [grounded.get("target_text") or "", grounded.get("title") or ""] + [str(s.get("title") or "") for s in doc["schedules"]]
+    if not any(key in _squeeze(name) for name in names if name):
+        return grounded, []
+    return dict(grounded, city_text=""), [{"field": "city_text", "value": city, "reason": "schedule_name"}]
+
+
+def recover_city_text(message: str, *, model_saw_city: bool) -> str | None:
+    """(F3) 지역을 물은 뒤의 대답에서 사용자 원문 그대로의 지역 표현을 꺼낸다(3단계 recover_city_answer와 같은 모양 규칙 재사용).
+    문장 전체가 지역 이름 모양일 때만: 두 단어는 도 이름·시군구 접미사가 있을 때, 한 단어는 정상 지역 표지가 있거나 모델이 지역을
+    알아챈 경우(근거 확인에서 버려진 지역 값이 있음). '글쎄'·'몰라'·'아니'·'그래도' 같은 말은 지역으로 보지 않는다."""
+    text = od.CITY_ANSWER_ENDING.sub("", re.sub(r"[\s.!~]+$", "", (message or "").strip())).strip()
+    words = [w for w in re.split(r"[,\s]+", text) if w]
+    if not words or len(words) > 2 or len(text) > 20 or any(not re.fullmatch(r"[가-힣]{2,10}", w) for w in words):
+        return None
+    if UNCERTAIN_MARKS.search(text) or NEGATION_START.search(text) or re.match(r"몰라|그래|그러|아니|글쎄", text):
+        return None
+    if len(words) == 2 and not any(od.PROVINCE_ANSWER.match(w) or od.CITY_UNIT.search(w) for w in words):
+        return None
+    if len(words) == 1 and not (region_marked(text) or model_saw_city):
+        return None
+    return text
+
+
+def operation_conflict(t: Turn) -> str | None:
+    """(F1) 모델은 변경(update)이라 했는데 발화가 취소 요청이거나 날씨가 붙은 완료 표현이면 'cancel'·'complete'. 아니면 None.
+    바꿀 시각·날짜·계산되는 상대 시각이 있거나 변경 표현('바꿔·옮겨')이 함께 있으면 변경 요청으로 둔다(다른 일정 취소가 이유인 경우 포함)."""
+    u, text = t.u, t.message
+    # 대상의 날짜·시각을 새 칸에 한 번 더 옮겨 적은 값(실측: date_text·new_date_text 모두 '내일')은 바꿀 값으로 보지 않는다(D38과 같은 중복 기재).
+    new_date = u["new_date_text"] and _squeeze(u["new_date_text"]) != _squeeze(u["date_text"])
+    new_time = u["new_time_text"] and _squeeze(u["new_time_text"]) != _squeeze(u["time_text"])
+    if UPDATE_MARKS.search(text) or new_date or new_time:
+        return None
+    moved = sv.resolve_shift(u["shift_text"], t.now) if u["shift_text"] else None
+    if moved and "at" in moved:
+        return None
+    if CANCEL_REQUEST_MARKS.search(text) and not (CANCEL_BLOCK_MARKS.search(text) or NEGATION_ANY.search(text)):
+        return "cancel"
+    if COMPLETE_MARKS.search(text) and said_conditions(text):
+        return "complete"
+    return None
+
+
 def said_conditions(message: str) -> list[str]:
     """발화에 나온 날씨 조건 낱말의 조건 이름 목록"""
     return [p for p in PREFERENCES if CONDITION_WORDS[p].search(message or "")]
@@ -729,6 +809,11 @@ def understand_schedule(t: Turn) -> dict[str, Any]:
 
     # 2. 발화 근거가 없는 표현은 버린다. 모델이 처음 낸 값과 검사 뒤 값을 함께 남긴다.
     grounded, discarded = ground_texts(understanding, t.message, t.state["history"])
+    # (5-6 F2 보완) 일정 이름 안의 낱말('공원 걷기'의 '공원')을 지역으로 쓰지 않는다. 지우면 날씨 조건이 있을 때 기존 흐름이 지역을 묻는다.
+    grounded, name_city = drop_name_city(grounded, t.doc)
+    discarded += name_city
+    if name_city:
+        t.rule("city_text_was_schedule_name")
     t.result["llm"]["understanding"] = grounded
     t.result["llm"]["model_understanding"] = understanding
     t.result["llm"]["discarded"] = discarded + [{"field": "target_ids", "value": i} for i in dropped]
@@ -1398,7 +1483,42 @@ def ambiguous_city(t: Turn, draft: dict[str, Any], kind: str | None = None) -> b
     draft["city"] = None
     if kind:
         hold_said(t, draft, kind)
+    # (5-6 F3 보완) 이 지역이 확정될 때까지 지역을 뺀 카드를 만들지 않도록 표시한다(문자열만 담는 기존 pending 칸).
+    draft["pending"] = {**draft["pending"], CITY_REQUIRED: city.strip(), CITY_TRIES: "1"}
     ask(t, draft, "city", f"어느 지역인지 정할 수 없어요. {options} 중 어디인지 알려 주세요.")
+    return True
+
+
+def city_unconfirmed(t: Turn, draft: dict[str, Any], kind: str) -> bool:
+    """(5-6 F3 보완) 확인 중인 지역(사용자가 말한 지역·모호한 지역)이 아직 정해지지 않았으면 카드를 만들지 않는다. 물었거나 끝냈으면 True.
+    지역 질문을 한 번 더 하고, 그래도 정해지지 않으면 제안을 보류하고 초안을 지운다(지역을 임의로 빼거나 고르지 않음)."""
+    said = draft["pending"].get(CITY_REQUIRED)
+    if not said:
+        return False
+    if draft["city"]:
+        draft["pending"] = {k: v for k, v in draft["pending"].items() if k not in (CITY_REQUIRED, CITY_TRIES)}
+        return False
+    if draft["pending"].get(CITY_TRIES, "1") != "1":
+        t.rule("city_unconfirmed_proposal_held")
+        reply(t, "지역을 확인하지 못해 일정을 제안하지 않았어요. 지역을 정해서 다시 말씀해 주세요.")
+        return True
+    hold_said(t, draft, kind)
+    draft["pending"] = {**draft["pending"], CITY_TRIES: "2"}
+    options = AMBIGUOUS_CITY_NAMES.get(said.lower())
+    ask(t, draft, "city", f"지역을 확인하지 못했어요. {options} 중 어디인지 지역 이름만 말씀해 주세요." if options
+        else f"지역을 확인하지 못했어요. 말씀하신 '{said}'처럼 지역 이름만 다시 알려 주세요.")
+    return True
+
+
+def ask_said_region(t: Turn, draft: dict[str, Any]) -> bool:
+    """(5-6 F3 보완) 등록에서 사용자가 지역 이름('인천에서')을 말했는데 모델이 지역을 비웠으면 카드 전에 지역을 묻는다. 물었으면 True"""
+    region = said_region(t.message)
+    if draft["city"] or not region or draft["pending"].get(CITY_REQUIRED):
+        return False
+    hold_said(t, draft, "create")
+    draft["pending"] = {**draft["pending"], CITY_REQUIRED: region, CITY_TRIES: "1"}
+    t.rule("said_region_not_extracted_asked")
+    ask(t, draft, "city", f"말씀에 지역 이름({region})이 있어요. 일정 지역을 알려 주세요.")
     return True
 
 
@@ -1606,9 +1726,13 @@ def ask_cancel_confirm(t: Turn, *, weather: bool = False) -> bool:
         return False
     draft.update(target_id=item["schedule_id"], confirm_tries=1)
     t.rule("cancel_weather_confirm_asked" if weather else "cancel_negation_confirm_asked")
-    lead = "말씀에 날씨 이야기가 있어요. 날씨와 관계없이 " if weather else ""
+    # (5-6 F1 보완) 조건부 취소는 지원하지 않는다는 사실을 먼저 밝히고, 날씨와 관계없이 지금 바로 취소할지만 묻는다.
+    # 물어본 날씨 조건을 기존 asked 칸에 남겨, 대답에 조건을 다시 붙이면('응, 비 오면 취소해') 동의로 보지 않게 한다.
+    if weather:
+        draft["asked"] = said_conditions(t.message)
+    lead = "날씨에 따라 취소하는 기능(예: 비가 오면 취소)은 아직 없어요. 날씨와 관계없이 " if weather else ""
     when = when_text(sv.interval(item)[0], t.now)
-    ask(t, draft, "cancel_confirm", f"{lead}'{item['title']}'({when}) 일정을 {'지금 ' if weather else ''}취소할까요? "
+    ask(t, draft, "cancel_confirm", f"{lead}'{item['title']}'({when}) 일정을 {'지금 바로 ' if weather else ''}취소할까요? "
                                     "취소하시려면 '응', 그대로 두시려면 '아니'라고 말씀해 주세요.")
     return True
 
@@ -1616,9 +1740,16 @@ def ask_cancel_confirm(t: Turn, *, weather: bool = False) -> bool:
 def settle_cancel(t: Turn, draft: dict[str, Any]) -> bool:
     """취소 확인 대답 처리. 진행하면 True(취소 제안), 아니면 답변·질문을 남기고 False"""
     answer, evidence = understand_confirm(t, draft)
-    if answer == "yes" and not confirm_conflict(t, answer, evidence, "cancel_confirm"):
+    # (5-6 F1 보완) 날씨 취소 확인에서 대답에 조건을 다시 붙였으면('비 오면 취소해') 명시적으로 풀지 않은 한 즉시 취소 동의가 아니다.
+    said = said_conditions(t.message) if draft["asked"] else []
+    reattached = bool(set(said) - set(explicit_waiver(t.message, said)))
+    if answer == "yes" and not confirm_conflict(t, answer, evidence, "cancel_confirm") and not reattached:
         draft["awaiting"] = None
         t.rule("cancel_confirmed")
+        # (5-6 F1 보완) 날씨 취소 확인을 통과한 동의는 '날씨와 관계없이 취소'라는 명시적 조건 철회다. 다른 철회와 같은 규칙 이름으로 남겨
+        # 측정 도구가 모델의 조건 누락과 구분하게 한다(검증된 철회만 기록, 동작은 바꾸지 않음).
+        for p in draft["asked"]:
+            t.rule(f"weather_condition_withdrawn:{p}")
         return True
     if answer in ("no", "cancel"):
         reply(t, "알겠어요. 일정은 취소하지 않고 그대로 둘게요.", "schedule_kept")
@@ -1693,7 +1824,7 @@ def handle_update(t: Turn) -> None:
     # (2차 검토 보완) 지역 질문에 대한 대답('인천')은 초안에 남겨 예보 조회에만 쓴다. 일정에 저장된 지역은 바꾸지 않는다.
     if u["city_text"]:
         draft["city"] = u["city_text"]
-    if ambiguous_city(t, draft, "update"):
+    if ambiguous_city(t, draft, "update") or city_unconfirmed(t, draft, "update"):
         return
     if guard_conditions(t, draft, "update"):        # (5-6 D34 보완) 말한 날씨 조건을 모델이 빠뜨렸으면 카드 전에 묻는다
         return
@@ -1851,9 +1982,11 @@ def handle_create(t: Turn) -> None:
     # (검토 보완) 등록에서도 사용자가 말한 날씨 선호('비 안 오는 시간에')를 초안에 남겨 시간 고르기에 쓴다.
     merge_conditions(draft, u)      # (5-6 D44 보완) 새 조건은 더한다(바꿔치기하지 않음)
     draft["check_weather"] = draft["check_weather"] or u["check_weather"]
-    if ambiguous_city(t, draft, "create"):
+    if ambiguous_city(t, draft, "create") or city_unconfirmed(t, draft, "create"):
         return
     if guard_conditions(t, draft, "create"):        # (5-6 D34 보완) 말한 날씨 조건을 모델이 빠뜨렸으면 카드 전에 묻는다
+        return
+    if ask_said_region(t, draft):                   # (5-6 F3 보완) 말한 지역 이름을 모델이 빠뜨렸으면 카드 전에 묻는다
         return
     if u["duration_text"]:
         minutes = sv.parse_minutes(u["duration_text"])
@@ -2116,6 +2249,15 @@ def _dispatch(t: Turn, mode: str) -> None:
     # 1. 진행 중인 일정 상담의 대답인지 확인한다.
     # (5-6 D36·D37 보완) answers_previous_question이나 correction 하나만으로 잇지 않는다. Python이 물어본 항목의 대답인지(answer_fits)와
     # 새 요청 신호(다른 이름·대상)를 함께 본다. 확인할 수 있는 항목을 물었는데 맞지 않으면 대답으로 보지 않는다.
+    if draft and draft["awaiting"] == "city" and not u["city_text"]:
+        # (5-6 F3 보완) 지역 질문의 대답인데 모델이 city_text를 비우면 사용자 원문에서 지역 표현을 꺼낸다(3단계 규칙과 같은 모양 검사).
+        # 일정 이름이라 버린 값(F2)은 모델이 지역을 알아챈 근거로 보지 않는다.
+        saw = any(isinstance(d, dict) and d.get("field") == "city_text" and d.get("reason") != "schedule_name"
+                  for d in t.result["llm"].get("discarded") or [])
+        recovered = recover_city_text(t.message, model_saw_city=saw)
+        if recovered:
+            t.u = u = dict(u, city_text=recovered, **{k: "" for k in TEXT_FIELDS if k != "city_text"})
+            t.rule("city_answer_recovered_from_user_text")
     if draft:
         checkable = draft["awaiting"] in ("time", "date", "target", "confirm", "city", "title", "duration") + CONFIRM_KINDS
         confirming = draft["awaiting"] in CONFIRM_KINDS
@@ -2184,6 +2326,22 @@ def _dispatch(t: Turn, mode: str) -> None:
         if ask_cancel_confirm(t, weather=True):
             return
         return conditional_unsupported(t, operation)
+    if operation == "update" and mode != "recheck" and request_mode != "question" and not (draft and draft["awaiting"]):
+        # (5-6 F1 보완) 진행 중인 질문이 없는데 모델의 변경(update)이 발화의 취소 요청·날씨가 붙은 완료 표현과 어긋나면 이동 경로
+        # (위임 확인·조건부 변경)로 보내지 않는다. 취소는 확인 질문(날씨 낱말이 있으면 조건부 취소 미지원 안내 + 즉시 취소 확인), 완료는 미지원 안내.
+        conflict = operation_conflict(t)
+        if conflict == "cancel":
+            t.rule("operation_conflict_cancel")
+            weather = bool(said_conditions(t.message))
+            if ask_cancel_confirm(t, weather=weather):
+                return
+            if weather:
+                return conditional_unsupported(t, "cancel")
+            t.u = dict(u, operation="cancel")
+            return handle_cancel_complete(t, "cancel")
+        if conflict == "complete":
+            t.rule("operation_conflict_complete")
+            return conditional_unsupported(t, "complete")
     if mode == "recheck" and (operation not in CHANGE_OPERATIONS or request_mode == "question"):
         t.rule("recheck_not_schedule_change")
         return hand_off(t)

@@ -3467,6 +3467,185 @@ class I_AG15_ConfirmSafety(AgentCase):
             self.assertEqual(sorted(sa.explicit_waiver(text, both)), want, text)
 
 
+# %% I-AG16. 5-6 GPU 종합 검증 결함 F1·F2·F3 회귀 (조건부 취소·완료의 변경 오분류, 일정 이름의 지역 오인, 확정되지 않은 지역)
+# 핵심 요약: F1 '비 오면 장보기 취소해 줘'를 모델이 변경(update)으로 분류하면 위임 확인 → '응' → 시장 이동 카드가 나왔다(실측 PE-MT 3/3).
+# F2 '공원 걷기'의 '공원'을 지역으로 써서 '공원' 예보로 조건을 확인했다(실측 LV3). F3 모호한 지역을 되물은 뒤 대답을
+# 확정하지 못했는데도 지역 없이 등록 카드를 만들었다(실측 LV6). 모두 승인 전에는 파일이 바뀌지 않는다.
+MT_CANCEL = "비 오면 내일 장보기 취소해 줘"
+MT_CANCEL_U = {"operation": "update", "target_text": "장보기", "date_text": "내일", "preferences": ["avoid_rain"]}
+WALK_EVENING = "공원 걷기 저녁 비 안 오는 시간으로 바꿔 줘"
+WALK_EVENING_U = {"operation": "update", "target_text": "공원 걷기", "new_time_text": "저녁", "preferences": ["avoid_rain"],
+                  "city_text": "공원"}
+
+
+class I_AG16_OperationAndCity(AgentCase):
+    flow = I_AG14_WeatherConditionGuard.flow
+    rules = I_AG14_WeatherConditionGuard.rules
+    add_walk = I_AG11_AmbiguousCityKeepsDraft.add_walk
+    city_flow = I_AG11_AmbiguousCityKeepsDraft.flow
+
+    def card(self, result: dict[str, Any]) -> dict[str, Any]:
+        return got(result, "proposed_action")["payload"]
+
+    def test_AG117_conditional_cancel_labelled_update_asks_unconditional_cancel(self):
+        """AG117 (F1) '비 오면 내일 장보기 취소해 줘'를 모델이 update + avoid_rain으로 냄 → 위임 확인 없이 '조건부 취소는 아직 없어요'와
+        날씨와 관계없이 지금 취소할지 묻는다(카드 없음) → '응'(근거) → 시장 취소 카드(이동 카드 아님, 승인 전 파일 불변)
+        (수정 전: 위임 확인 질문 → '응' → 시장 15:00 이동 카드). 실측 원문 모양(new_date_text에 같은 '내일', shift_text '취소')도 같다"""
+        recorded = dict(MT_CANCEL_U, new_date_text="내일", shift_text="취소", duration_text="취소", shift_base="schedule",
+                        answers_previous_question=True, target_ids=[SID["시장"]])        # 실측 PE-MT-v0 일정 이해
+        for first_u in (MT_CANCEL_U, recorded):
+            with self.subTest(first_u=sorted(first_u)):
+                self.setUp()
+                results = self.flow([(MT_CANCEL, first_u), ("응", ANSWER_U)], {14: dict(RAIN)}, confirms={"응": yes("응")})
+                self.assertIsNone(results[0]["proposed_action"])
+                self.assertEqual(results[0]["missing_fields"], ["cancel_confirm"])
+                self.assertIn("아직 없어요", results[0]["answer"])
+                self.assertIn("날씨와 관계없이", results[0]["answer"])
+                self.assertIn("operation_conflict_cancel", self.rules(results[0]))
+                self.assertNotIn("delegation_confirm_asked", self.rules(results[0]))
+                action = got(results[1], "proposed_action")
+                self.assertEqual((action["type"], action["payload"]["schedule_id"]), ("cancel_schedule", SID["시장"]))
+                self.assertIn("weather_condition_withdrawn:avoid_rain", self.rules(results[1]))     # 검증된 조건 철회 기록
+
+    def test_AG118_unconditional_cancel_needs_a_clear_yes(self):
+        """AG118 (F1) 날씨 취소 확인의 대답: 조건을 다시 붙인 긍정('응, 비 오면 취소해')·'글쎄'는 카드 없이 다시 묻고, '아니'는 유지.
+        '날씨 상관없이 지금 취소해'·'비 와도 상관없이 취소해'(근거 있는 yes)는 취소 카드. D50 경로(cancel·조건 없음)도 같은 새 문구"""
+        cancel_answer = {"operation": "cancel", "answers_previous_question": True}
+        for answer, confirm in (("응, 비 오면 취소해", yes("응")), ("글쎄", yes("글쎄"))):
+            with self.subTest(answer):
+                self.setUp()
+                second = self.flow([(MT_CANCEL, MT_CANCEL_U), (answer, cancel_answer)], confirms={answer: confirm})[1]
+                self.assertIsNone(second["proposed_action"])
+                self.assertEqual(second["missing_fields"], ["cancel_confirm"])
+                self.assertFalse([r for r in self.rules(second) if r.startswith("weather_condition_withdrawn")])
+        self.setUp()
+        kept = self.flow([(MT_CANCEL, MT_CANCEL_U), ("아니", dict(cancel_answer, request_mode="negated"))], confirms={"아니": "no"})[1]
+        self.assertIsNone(kept["proposed_action"])
+        self.assertIn("그대로", kept["answer"])
+        for answer in ("날씨 상관없이 지금 취소해", "비 와도 상관없이 취소해"):
+            with self.subTest(answer):
+                self.setUp()
+                second = self.flow([(MT_CANCEL, MT_CANCEL_U), (answer, cancel_answer)], confirms={answer: yes(answer)})[1]
+                self.assertEqual(got(second, "proposed_action")["type"], "cancel_schedule")
+        self.setUp()
+        [first] = self.flow([(MT_CANCEL, {"operation": "cancel", "target_text": "장보기", "date_text": "내일"})])
+        self.assertIn("아직 없어요", first["answer"])
+        self.assertIn("cancel_weather_confirm_asked", self.rules(first))
+
+    def test_AG119_conditional_complete_labelled_update_is_unsupported(self):
+        """AG119 (F1 완료) '비 오면 산책 완료로 해 줘'(update + avoid_rain) → 미지원 안내, 카드 없음(수정 전: 위임 확인 질문).
+        날씨가 없는 '오늘 시장 끝냈어'(update 오표기)는 지금 동작 그대로(새 규칙이 끼어들지 않음)"""
+        [result] = self.flow([("비 오면 산책 완료로 해 줘", {"operation": "update", "target_text": "산책", "preferences": ["avoid_rain"]})])
+        self.assertIsNone(result["proposed_action"])
+        self.assertEqual(result["decision"]["kind"], "schedule_condition_unsupported")
+        self.assertIn("operation_conflict_complete", self.rules(result))
+        self.setUp()
+        [plain] = self.flow([("오늘 시장 끝냈어", {"operation": "update", "target_text": "시장", "date_text": "오늘"})])
+        self.assertFalse([r for r in self.rules(plain) if r.startswith("operation_conflict")])
+
+    def test_AG120_change_requests_mentioning_other_cancellations_are_kept(self):
+        """AG120 (F1 보존) 다른 일정의 취소를 이유로 한 변경, 취소하지 말라는 말은 취소 확인으로 바꾸지 않는다"""
+        [moved] = self.flow([("병원이 취소돼서 시장을 오후 다섯 시로 옮겨 줘",
+                              {"operation": "update", "target_text": "시장", "new_time_text": "오후 다섯 시", "reason_text": "병원이 취소돼서"})])
+        self.assertEqual(self.card(moved)["after"]["start_at"], ss.iso(at(26, 17)))
+        for text in ("병원이 취소돼서 시장 시간 좀 바꿔 줘", "병원 취소하고 시장 시간 바꿔 줘"):
+            with self.subTest(text):
+                self.setUp()
+                [result] = self.flow([(text, {"operation": "update", "target_text": "시장"})])
+                self.assertIsNone(result["proposed_action"])
+                self.assertEqual(result["missing_fields"], ["time"])
+                self.assertFalse([r for r in self.rules(result) if r.startswith("operation_conflict")])
+        self.setUp()
+        [kept] = self.flow([("비 와도 장보기 취소하지 마", {"operation": "update", "target_text": "장보기"})])
+        self.assertIsNone(kept["proposed_action"])
+        self.assertFalse([r for r in self.rules(kept) if r.startswith(("operation_conflict", "cancel_"))])
+
+    def test_AG121_schedule_name_word_is_not_used_as_city(self):
+        """AG121 (F2) '공원 걷기'의 '공원'을 지역으로 냄 → '공원' 예보 조회 없이 지역 질문 → '인천' → 인천 예보로 19:00(18시 비)
+        등록 '모레 오후 세 시에 공원 산책 등록해 줘'(지역 '공원') → 지역 없이 카드 (수정 전: '공원' 예보로 카드, 등록 지역 '공원')"""
+        self.add_walk()
+        results = self.flow([(WALK_EVENING, WALK_EVENING_U), ("인천", dict(ANSWER_U, city_text="인천"))], {18: dict(RAIN)})
+        self.assertEqual(results[0]["missing_fields"], ["city"])
+        self.assertIn("city_text_was_schedule_name", self.rules(results[0]))
+        self.assertNotIn("공원", [c["city"] for c in self.weather.calls])
+        self.assertEqual(self.card(results[1])["after"]["start_at"], ss.iso(at(26, 19)))
+        self.setUp()
+        [made] = self.flow([("모레 오후 세 시에 공원 산책 등록해 줘", {"operation": "create", "title": "공원 산책", "date_text": "모레",
+                                                          "time_text": "오후 세 시", "city_text": "공원"})])
+        self.assertIsNone(self.card(made)["after"]["city"])
+
+    def test_AG122_real_city_names_are_kept(self):
+        """AG122 (F2 보존) 일정 이름 안에 있어도 정상 지역 표지(광역시 이름·시·군·구·도·도 이름·모호 지역표)가 있으면 지역을 지우지 않는다"""
+        doc = seed_doc()
+        for target, city in (("인천 시장 가는", "인천"), ("경기도 광주 친구", "경기도 광주"), ("광주광역시 병원", "광주광역시"),
+                             ("부산 여행", "부산"), ("광주 친구", "광주"), ("수원시 모임", "수원시")):
+            with self.subTest(city):
+                grounded, discarded = sa.drop_name_city({"target_text": target, "title": "", "city_text": city}, doc)
+                self.assertEqual((grounded["city_text"], discarded), (city, []))
+        grounded, discarded = sa.drop_name_city({"target_text": "공원 걷기", "title": "", "city_text": "공원"}, doc)
+        self.assertEqual((grounded["city_text"], [d["field"] for d in discarded]), ("", ["city_text"]))
+        grounded, _ = sa.drop_name_city({"target_text": "", "title": "", "city_text": "시장"}, doc)
+        self.assertEqual(grounded["city_text"], "")                                  # 등록된 일정 제목('시장 장보기') 안의 낱말
+        [market] = self.flow([("내일 인천 시장 가는 거 오후 다섯 시로 옮겨 줘",
+                               {"operation": "update", "target_text": "인천 시장 가는", "new_time_text": "오후 다섯 시", "city_text": "인천"})])
+        self.assertEqual(self.card(market)["after"]["start_at"], ss.iso(at(26, 17)))
+
+    def test_AG123_city_answer_is_recovered_from_the_user_text(self):
+        """AG123 (F3) '광주'를 되물은 뒤 '경기도 광주'라고 답했는데 모델이 city_text를 비움 → 사용자 원문에서 지역을 꺼내 카드
+        (수정 전: 지역 없이 등록 카드). 변경도 같다: '광주광역시'(city_text 비움) → 광주광역시 예보로 17:00"""
+        results = self.city_flow(GWANGJU_CREATE, GWANGJU_CREATE_U, [("경기도 광주", answer_u("create"))])
+        self.assertEqual(self.card(results[-1])["after"]["city"], "경기도 광주")
+        self.assertIn("city_answer_recovered_from_user_text", self.rules(results[-1]))
+        self.setUp()
+        self.add_walk()
+        results = self.city_flow(WALK_GWANGJU, WALK_GWANGJU_U, [("광주광역시", answer_u("update"))])
+        self.assertEqual(self.card(results[-1])["after"]["start_at"], ss.iso(at(26, 17)))
+        self.assertIn("광주광역시", [c["city"] for c in self.weather.calls])
+        for text, want in (("경기도 광주", "경기도 광주"), ("인천이야", "인천"), ("광주광역시요", "광주광역시"), ("수원시", "수원시"),
+                           ("글쎄", None), ("몰라", None), ("그래도", None), ("아니", None), ("오후 세 시", None), ("친구", None)):
+            self.assertEqual(sa.recover_city_text(text, model_saw_city=False), want, text)
+
+    def test_AG124_unconfirmed_city_holds_the_proposal(self):
+        """AG124 (F3) 확인 중인 지역이 끝내 정해지지 않으면 지역을 빼고 카드를 만들지 않는다: '글쎄' → 다시 질문 → '몰라' → 제안 보류
+        (수정 전: '글쎄'에 지역 없는 등록 카드). 변경도 같다. 첫 턴에 말한 지역('인천에서')을 모델이 빠뜨리면 지역을 묻고 카드 없음"""
+        for first, first_u, kind in ((GWANGJU_CREATE, GWANGJU_CREATE_U, "create"), (WALK_GWANGJU, WALK_GWANGJU_U, "update")):
+            with self.subTest(kind):
+                self.setUp()
+                if kind == "update":
+                    self.add_walk()
+                results = self.city_flow(first, first_u, [("글쎄", answer_u(kind)), ("몰라", answer_u(kind))])
+                self.assertIsNone(results[1]["proposed_action"])
+                self.assertEqual(results[1]["missing_fields"], ["city"])
+                self.assertIsNone(results[2]["proposed_action"])
+                self.assertIn("지역을 확인하지 못해", results[2]["answer"])
+                self.assertIn("city_unconfirmed_proposal_held", self.rules(results[2]))
+                self.assertIsNone(results[2]["conversation_state"]["draft"])
+        self.setUp()
+        text = "모레 오후 세 시에 인천에서 친구 만나"
+        results = self.flow([(text, {"operation": "create", "title": "친구 만나", "date_text": "모레", "time_text": "오후 세 시"}),
+                             ("인천", answer_u("create", city_text="인천"))])
+        self.assertIsNone(results[0]["proposed_action"])
+        self.assertEqual(results[0]["missing_fields"], ["city"])
+        self.assertIn("인천", results[0]["answer"])
+        after = self.card(results[1])["after"]
+        self.assertEqual((after["start_at"], after["city"]), (ss.iso(at(27, 15)), "인천"))
+
+    def test_AG125_plain_creates_without_a_city_are_kept(self):
+        """AG125 (F3 보존) 지역을 말하지 않은 일반 등록은 질문 없이 지역 없는 카드 그대로. '세 시'·'친구'·'포도'·'서울대병원'에 반응하지 않는다"""
+        for text, u in (("내일 아침 여덟 시에 산책할 거야. 기억해 줘.",
+                         {"operation": "create", "title": "산책", "date_text": "내일", "time_text": "아침 여덟 시"}),
+                        ("모레 오후 세 시에 친구 집에 갈 거야", {"operation": "create", "title": "친구 집", "date_text": "모레", "time_text": "오후 세 시"}),
+                        ("모레 오후 세 시에 서울대병원 가", {"operation": "create", "title": "서울대병원", "date_text": "모레", "time_text": "오후 세 시"})):
+            with self.subTest(text):
+                self.setUp()
+                [result] = self.flow([(text, u)])
+                self.assertIsNone(self.card(result)["after"]["city"])
+        for text in ("포도 따러 갈 거야", "서울대병원 가", "광주리 사러 가", "친구 만나 세 시에"):
+            self.assertIsNone(sa.said_region(text), text)
+        self.assertEqual(sa.said_region("내일 인천에서 친구 만나"), "인천")
+        self.assertEqual(sa.said_region("부산 가는 날"), "부산")
+
+
 class M_AG7_LiveJudge(StoreCase):
 
     def test_AG39_proposal_judge_checks_time_duration_and_target(self):
